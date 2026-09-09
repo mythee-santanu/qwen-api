@@ -39,11 +39,15 @@ OLLAMA_URL = os.getenv(
     "http://host.docker.internal:11434",
 )
 
-# Chat / generation model
+# Chat model
 MODEL_NAME = "qwen3.5:0.8b"
 
 # Embedding model
 EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
+
+# Embedding limits
+MAX_EMBEDDING_BATCH = 8
+MAX_EMBEDDING_CHARS = 16000
 
 ADMIN_MASTER_KEY = os.getenv("ADMIN_MASTER_KEY")
 
@@ -113,6 +117,9 @@ async def health():
         "status": "ok",
         "model": MODEL_NAME,
         "embedding_model": EMBEDDING_MODEL_NAME,
+        "embedding_dimensions": 1024,
+        "max_embedding_batch": MAX_EMBEDDING_BATCH,
+        "max_embedding_chars": MAX_EMBEDDING_CHARS,
     }
 
 
@@ -295,7 +302,7 @@ async def chat_completions(
     }
 
     # ----------------------------------------------
-    # Call Ollama + measure response time
+    # Call Ollama
     # ----------------------------------------------
 
     try:
@@ -321,31 +328,41 @@ async def chat_completions(
         )
 
     # ----------------------------------------------
-    # Parse Ollama response
+    # Parse response
     # ----------------------------------------------
 
     try:
         data = response.json()
-
-        content = data.get(
-            "message",
-            {},
-        ).get(
-            "content",
-            "",
-        )
-
     except ValueError:
         raise HTTPException(
             status_code=502,
             detail="Invalid response received from Ollama",
         )
 
+    content = data.get(
+        "message",
+        {},
+    ).get(
+        "content",
+        "",
+    )
+
     if not content:
         raise HTTPException(
             status_code=502,
             detail="Ollama returned an empty response",
         )
+
+    # ----------------------------------------------
+    # Finish reason
+    # ----------------------------------------------
+
+    done_reason = data.get("done_reason", "stop")
+
+    if done_reason == "length":
+        finish_reason = "length"
+    else:
+        finish_reason = "stop"
 
     # ----------------------------------------------
     # OpenAI-compatible response
@@ -363,7 +380,7 @@ async def chat_completions(
                     "role": "assistant",
                     "content": content,
                 },
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }
         ],
     }
@@ -390,13 +407,17 @@ async def create_embeddings(
         )
 
     # ----------------------------------------------
-    # Validate input
+    # Normalize input
     # ----------------------------------------------
 
     if isinstance(request.input, str):
         inputs = [request.input]
     else:
         inputs = request.input
+
+    # ----------------------------------------------
+    # Empty input
+    # ----------------------------------------------
 
     if not inputs:
         raise HTTPException(
@@ -405,7 +426,50 @@ async def create_embeddings(
         )
 
     # ----------------------------------------------
+    # Maximum batch size
+    # ----------------------------------------------
+
+    if len(inputs) > MAX_EMBEDDING_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Maximum {MAX_EMBEDDING_BATCH} texts "
+                "are allowed per embedding request"
+            ),
+        )
+
+    # ----------------------------------------------
+    # Maximum text size
+    # ----------------------------------------------
+
+    for index, text in enumerate(inputs):
+
+        if not isinstance(text, str):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input at index {index} must be a string",
+            )
+
+        if not text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"Input at index {index} cannot be empty",
+            )
+
+        if len(text) > MAX_EMBEDDING_CHARS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Input at index {index} exceeds "
+                    f"maximum {MAX_EMBEDDING_CHARS} characters"
+                ),
+            )
+
+    # ----------------------------------------------
     # Generate embeddings
+    #
+    # Sequential processing is intentional because
+    # this VPS has only 1 CPU core.
     # ----------------------------------------------
 
     embeddings = []
@@ -414,12 +478,15 @@ async def create_embeddings(
         start_time = time.perf_counter()
 
         async with httpx.AsyncClient(timeout=300.0) as client:
+
             for text in inputs:
+
                 response = await client.post(
                     f"{OLLAMA_URL}/api/embed",
                     json={
                         "model": EMBEDDING_MODEL_NAME,
                         "input": text,
+                        "keep_alive": "30m",
                     },
                 )
 
@@ -435,7 +502,19 @@ async def create_embeddings(
                         detail="Ollama returned an empty embedding",
                     )
 
-                embeddings.append(vector_list[0])
+                embedding = vector_list[0]
+
+                # Expected Qwen3 embedding dimension
+                if len(embedding) != 1024:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "Unexpected embedding dimensions: "
+                            f"{len(embedding)}"
+                        ),
+                    )
+
+                embeddings.append(embedding)
 
         response_time_ms = round(
             (time.perf_counter() - start_time) * 1000,
@@ -445,14 +524,20 @@ async def create_embeddings(
     except HTTPException:
         raise
 
-    except (httpx.HTTPError, ValueError) as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Ollama embedding request failed: {str(exc)}",
         )
 
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid JSON response from Ollama",
+        )
+
     # ----------------------------------------------
-    # OpenAI-compatible embedding response
+    # OpenAI-compatible response
     # ----------------------------------------------
 
     return {
