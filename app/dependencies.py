@@ -15,9 +15,7 @@ bearer_scheme = HTTPBearer(
 
 
 def get_current_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(
-        bearer_scheme
-    ),
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> APIKey:
 
@@ -40,11 +38,7 @@ def get_current_api_key(
 
     key_hash = hash_api_key(api_key)
 
-    db_key = (
-        db.query(APIKey)
-        .filter(APIKey.key_hash == key_hash)
-        .first()
-    )
+    db_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
 
     if db_key is None:
         raise HTTPException(
