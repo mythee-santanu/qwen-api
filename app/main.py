@@ -26,7 +26,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Qwen API",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -39,7 +39,11 @@ OLLAMA_URL = os.getenv(
     "http://host.docker.internal:11434",
 )
 
-MODEL_NAME = "qwen3:1.7b"
+# Chat / generation model
+MODEL_NAME = "qwen3.5:0.8b"
+
+# Embedding model
+EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
 
 ADMIN_MASTER_KEY = os.getenv("ADMIN_MASTER_KEY")
 
@@ -65,6 +69,11 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[Message]
     stream: bool = False
+
+
+class EmbeddingRequest(BaseModel):
+    model: str
+    input: str | list[str]
 
 
 # --------------------------------------------------
@@ -103,6 +112,7 @@ async def health():
     return {
         "status": "ok",
         "model": MODEL_NAME,
+        "embedding_model": EMBEDDING_MODEL_NAME,
     }
 
 
@@ -211,7 +221,12 @@ async def list_models(
                 "id": MODEL_NAME,
                 "object": "model",
                 "owned_by": "local",
-            }
+            },
+            {
+                "id": EMBEDDING_MODEL_NAME,
+                "object": "model",
+                "owned_by": "local",
+            },
         ],
     }
 
@@ -254,16 +269,28 @@ async def chat_completions(
         "model": MODEL_NAME,
         "messages": [
             {
-                "role": message.role,
-                "content": message.content,
-            }
-            for message in request.messages
+                "role": "system",
+                "content": (
+                    "Answer directly and concisely. "
+                    "Use 1-2 complete sentences. "
+                    "Do not add unnecessary explanation."
+                ),
+            },
+            *[
+                {
+                    "role": message.role,
+                    "content": message.content,
+                }
+                for message in request.messages
+            ],
         ],
         "stream": False,
+        "think": False,
         "keep_alive": "30m",
         "options": {
             "num_ctx": 2048,
-            "temperature": 0.7,
+            "num_predict": 96,
+            "temperature": 0.2,
         },
     }
 
@@ -297,15 +324,28 @@ async def chat_completions(
     # Parse Ollama response
     # ----------------------------------------------
 
-    data = response.json()
+    try:
+        data = response.json()
 
-    content = data.get(
-        "message",
-        {},
-    ).get(
-        "content",
-        "",
-    )
+        content = data.get(
+            "message",
+            {},
+        ).get(
+            "content",
+            "",
+        )
+
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid response received from Ollama",
+        )
+
+    if not content:
+        raise HTTPException(
+            status_code=502,
+            detail="Ollama returned an empty response",
+        )
 
     # ----------------------------------------------
     # OpenAI-compatible response
@@ -326,4 +366,109 @@ async def chat_completions(
                 "finish_reason": "stop",
             }
         ],
+    }
+
+
+# --------------------------------------------------
+# Embeddings
+# --------------------------------------------------
+
+
+@app.post("/v1/embeddings")
+async def create_embeddings(
+    request: EmbeddingRequest,
+    api_key: APIKey = Depends(get_current_api_key),
+):
+    # ----------------------------------------------
+    # Model validation
+    # ----------------------------------------------
+
+    if request.model != EMBEDDING_MODEL_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model must be {EMBEDDING_MODEL_NAME}",
+        )
+
+    # ----------------------------------------------
+    # Validate input
+    # ----------------------------------------------
+
+    if isinstance(request.input, str):
+        inputs = [request.input]
+    else:
+        inputs = request.input
+
+    if not inputs:
+        raise HTTPException(
+            status_code=400,
+            detail="Input cannot be empty",
+        )
+
+    # ----------------------------------------------
+    # Generate embeddings
+    # ----------------------------------------------
+
+    embeddings = []
+
+    try:
+        start_time = time.perf_counter()
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            for text in inputs:
+                response = await client.post(
+                    f"{OLLAMA_URL}/api/embed",
+                    json={
+                        "model": EMBEDDING_MODEL_NAME,
+                        "input": text,
+                    },
+                )
+
+                response.raise_for_status()
+
+                data = response.json()
+
+                vector_list = data.get("embeddings")
+
+                if not vector_list:
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Ollama returned an empty embedding",
+                    )
+
+                embeddings.append(vector_list[0])
+
+        response_time_ms = round(
+            (time.perf_counter() - start_time) * 1000,
+            2,
+        )
+
+    except HTTPException:
+        raise
+
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Ollama embedding request failed: {str(exc)}",
+        )
+
+    # ----------------------------------------------
+    # OpenAI-compatible embedding response
+    # ----------------------------------------------
+
+    return {
+        "object": "list",
+        "data": [
+            {
+                "object": "embedding",
+                "index": index,
+                "embedding": embedding,
+            }
+            for index, embedding in enumerate(embeddings)
+        ],
+        "model": EMBEDDING_MODEL_NAME,
+        "response_time_ms": response_time_ms,
+        "usage": {
+            "prompt_tokens": 0,
+            "total_tokens": 0,
+        },
     }
