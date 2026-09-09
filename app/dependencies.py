@@ -15,7 +15,9 @@ bearer_scheme = HTTPBearer(
 
 
 def get_current_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    credentials: HTTPAuthorizationCredentials | None = Depends(
+        bearer_scheme
+    ),
     db: Session = Depends(get_db),
 ) -> APIKey:
 
@@ -38,18 +40,28 @@ def get_current_api_key(
 
     key_hash = hash_api_key(api_key)
 
-    db_key = db.query(APIKey).filter(APIKey.key_hash == key_hash).first()
+    db_key = (
+        db.query(APIKey)
+        .filter(APIKey.key_hash == key_hash)
+        .first()
+    )
 
     if db_key is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
         )
 
     if not db_key.active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="API key has been revoked",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
         )
 
     db_key.last_used_at = datetime.utcnow()
