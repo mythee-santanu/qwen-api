@@ -959,27 +959,35 @@ def validate_chat_request(
 def build_chat_payload(
     request: ChatCompletionRequest,
 ) -> dict:
+    messages = [
+        {
+            "role": message.role,
+            "content": message.content,
+        }
+        for message in request.messages
+    ]
+
+    completion_instruction = (
+        "Answer concisely and completely within the available output token limit. "
+        "Prioritize completing the answer over adding extra detail. "
+        "Always finish sentences and paragraphs naturally. "
+        "Do not start a new section unless you have enough space to complete it."
+    )
+
+    if messages and messages[0]["role"] == "system":
+        messages[0]["content"] += "\n\n" + completion_instruction
+    else:
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": completion_instruction,
+            },
+        )
 
     return {
         "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Answer concisely and completely. "
-                    "Stay within the requested output token limit. "
-                    "Finish naturally with complete sentences. "
-                    "Do not leave a sentence unfinished."
-                ),
-            },
-            *[
-                {
-                    "role": message.role,
-                    "content": message.content,
-                }
-                for message in request.messages
-            ],
-        ],
+        "messages": messages,
         "stream": False,
         "think": False,
         "keep_alive": OLLAMA_KEEP_ALIVE,
