@@ -176,7 +176,7 @@ class ChatCompletionRequest(BaseModel):
     )
 
     max_tokens: int = Field(
-        default=96,
+        default=256,
         ge=1,
         le=MAX_OUTPUT_TOKENS,
     )
@@ -964,10 +964,21 @@ def build_chat_payload(
         "model": MODEL_NAME,
         "messages": [
             {
-                "role": message.role,
-                "content": message.content,
-            }
-            for message in request.messages
+                "role": "system",
+                "content": (
+                    "Answer concisely and completely. "
+                    "Stay within the requested output token limit. "
+                    "Finish naturally with complete sentences. "
+                    "Do not leave a sentence unfinished."
+                ),
+            },
+            *[
+                {
+                    "role": message.role,
+                    "content": message.content,
+                }
+                for message in request.messages
+            ],
         ],
         "stream": False,
         "think": False,
