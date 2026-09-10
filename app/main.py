@@ -968,8 +968,12 @@ def build_chat_payload(
     ]
 
     completion_instruction = (
-        f"Answer completely within the {request.max_tokens}-token limit. "
-        "Prefer a concise, complete answer and finish naturally."
+        f"Answer the user's request completely and naturally within "
+        f"{request.max_tokens} tokens. Prioritize finishing the answer "
+        "over adding extra detail. Keep the response concise enough to "
+        "reach a complete ending. Do not begin a new section, list item, "
+        "or sentence unless you have enough space to finish it. "
+        "Always aim to end at a natural sentence boundary."
     )
 
     if messages and messages[0]["role"] == "system":
