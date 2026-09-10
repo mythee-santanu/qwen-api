@@ -968,10 +968,8 @@ def build_chat_payload(
     ]
 
     completion_instruction = (
-        "Answer concisely and completely within the available output token limit. "
-        "Prioritize completing the answer over adding extra detail. "
-        "Always finish sentences and paragraphs naturally. "
-        "Do not start a new section unless you have enough space to complete it."
+        f"Answer completely within the {request.max_tokens}-token limit. "
+        "Prefer a concise, complete answer and finish naturally."
     )
 
     if messages and messages[0]["role"] == "system":
@@ -1222,24 +1220,8 @@ async def stream_chat_response(
     api_key_id: int,
 ) -> AsyncGenerator[str, None]:
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": message.role,
-                "content": message.content,
-            }
-            for message in request.messages
-        ],
-        "stream": True,
-        "think": False,
-        "keep_alive": OLLAMA_KEEP_ALIVE,
-        "options": {
-            "num_ctx": 2048,
-            "num_predict": request.max_tokens,
-            "temperature": request.temperature,
-        },
-    }
+    payload = build_chat_payload(request)
+    payload["stream"] = True
 
     prompt_tokens = 0
     completion_tokens = 0
