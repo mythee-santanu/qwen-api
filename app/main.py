@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from .database import Base, engine, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey, APIKeyModelAccess, APIUsage
+from .chat_memory import router as chat_memory_router
 from .security import (
     generate_api_key,
     get_key_prefix,
@@ -51,7 +52,7 @@ app = FastAPI(
     description="OpenAI-compatible local Qwen API",
 )
 
-
+app.include_router(chat_memory_router)
 # ============================================================
 # Ollama Configuration
 # ============================================================
