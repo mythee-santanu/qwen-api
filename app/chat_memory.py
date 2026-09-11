@@ -1,20 +1,17 @@
 import json
 import logging
-
 from datetime import datetime
 
 import httpx
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
-
-from pgvector.sqlalchemy import Vector
 
 from .database import Base, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,24 +22,39 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_URL = "http://host.docker.internal:11434"
 
-CHAT_MODEL = "qwen3.5:0.8b"
+# Small model used ONLY for deciding whether a chat exchange
+# contains a durable memory worth storing.
+#
+# This is intentionally independent from the model selected by
+# the user for /v1/chat/completions.
+MEMORY_EXTRACTION_MODEL = "qwen3.5:0.8b"
 
 EMBEDDING_MODEL = "qwen3-embedding:0.6b"
-
 EMBEDDING_DIMENSIONS = 1024
 
-# How many relevant memories to pull into context per chat request.
+# Number of relevant memories retrieved for each memory-enabled
+# chat request.
 MEMORY_RETRIEVAL_TOP_K = 5
 
-# Cosine distance below this value is treated as "the same fact" for
-# dedup/update purposes (0 = identical, 2 = opposite). Kept tight so
-# only near-duplicate facts get merged rather than genuinely new ones.
+# Cosine distance threshold for considering two memories duplicates.
+#
+# Cosine distance:
+#   0.0 = identical
+#   larger = less similar
+#
+# Kept deliberately tight so genuinely different facts are not
+# accidentally merged.
 MEMORY_DEDUP_DISTANCE_THRESHOLD = 0.15
 
-# Default priority for new memories when the extractor omits one.
+# Default importance when the extraction model does not provide
+# a valid importance value.
 DEFAULT_MEMORY_IMPORTANCE = 5
 
+# Maximum time allowed for Ollama memory/embedding requests.
 OLLAMA_TIMEOUT = 120.0
+
+# Keep Ollama models warm for a while after use.
+OLLAMA_KEEP_ALIVE = "30m"
 
 
 router = APIRouter()
@@ -62,13 +74,27 @@ class UserMemory(Base):
         autoincrement=True,
     )
 
-    # Memory belongs directly to the API key. No conversation_id,
-    # no end_user_id - this is the only ownership scope that exists.
+    # --------------------------------------------------------
+    # Ownership
+    # --------------------------------------------------------
+    #
+    # A memory belongs directly to an API key.
+    #
+    # There is intentionally NO:
+    #   - conversation_id
+    #   - end_user_id
+    #
+    # This matches the application's long-term memory design.
+    #
     api_key_id: Mapped[int] = mapped_column(
         ForeignKey("api_keys.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
+
+    # --------------------------------------------------------
+    # Memory content
+    # --------------------------------------------------------
 
     memory: Mapped[str] = mapped_column(
         Text,
@@ -80,8 +106,12 @@ class UserMemory(Base):
         nullable=True,
     )
 
-    # Higher = more important. Used to decide what survives when
-    # memory_limit is reached.
+    # Higher value = more important.
+    #
+    # Used when memory_limit is reached:
+    #   lowest importance is removed first
+    #   oldest updated memory wins ties
+    #
     importance: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -89,10 +119,15 @@ class UserMemory(Base):
         server_default=str(DEFAULT_MEMORY_IMPORTANCE),
     )
 
+    # 1024-dimensional pgvector embedding.
     embedding: Mapped[list[float] | None] = mapped_column(
         Vector(EMBEDDING_DIMENSIONS),
         nullable=True,
     )
+
+    # --------------------------------------------------------
+    # Timestamps
+    # --------------------------------------------------------
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -109,13 +144,20 @@ class UserMemory(Base):
 
 
 # ============================================================
-# Access Control Helper
+# Access Control
 # ============================================================
 
 
 def require_memory_enabled(
     api_key: APIKey,
 ) -> None:
+    """
+    Require memory to be enabled for the current API key.
+
+    Memory belongs to the API key itself, so the authenticated
+    API key is the only ownership scope required.
+    """
+
     if not api_key.memory_enabled:
         raise HTTPException(
             status_code=403,
@@ -137,6 +179,13 @@ def require_memory_enabled(
 async def generate_embedding(
     text: str,
 ) -> list[float]:
+    """
+    Generate a 1024-dimensional embedding using Ollama.
+    """
+
+    if not text or not text.strip():
+        raise ValueError("Cannot generate embedding for empty text")
+
     async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/embed",
@@ -147,7 +196,6 @@ async def generate_embedding(
         )
 
         response.raise_for_status()
-
         data = response.json()
 
     embeddings = data.get("embeddings")
@@ -177,7 +225,17 @@ def load_relevant_memories(
     embedding: list[float],
     limit: int = MEMORY_RETRIEVAL_TOP_K,
 ) -> list[UserMemory]:
-    """Only ever searches memories owned by api_key_id."""
+    """
+    Retrieve the most semantically relevant memories belonging
+    to the specified API key.
+
+    IMPORTANT:
+    The api_key_id filter guarantees that memories belonging to
+    another API key can never be returned.
+    """
+
+    if limit <= 0:
+        return []
 
     return (
         db.query(UserMemory)
@@ -185,7 +243,10 @@ def load_relevant_memories(
             UserMemory.api_key_id == api_key_id,
             UserMemory.embedding.isnot(None),
         )
-        .order_by(UserMemory.embedding.cosine_distance(embedding))
+        .order_by(
+            UserMemory.embedding.cosine_distance(embedding),
+            UserMemory.id.asc(),
+        )
         .limit(limit)
         .all()
     )
@@ -196,7 +257,16 @@ def find_similar_memory(
     api_key_id: int,
     embedding: list[float],
 ) -> tuple[UserMemory | None, float | None]:
-    """Closest existing memory for this key (if any) and its cosine distance."""
+    """
+    Find the closest existing memory for this API key.
+
+    Returns:
+        (memory, cosine_distance)
+
+    or:
+
+        (None, None)
+    """
 
     row = (
         db.query(
@@ -207,7 +277,7 @@ def find_similar_memory(
             UserMemory.api_key_id == api_key_id,
             UserMemory.embedding.isnot(None),
         )
-        .order_by("distance")
+        .order_by("distance", UserMemory.id.asc())
         .first()
     )
 
@@ -216,13 +286,18 @@ def find_similar_memory(
 
     memory, distance = row
 
-    return memory, distance
+    if distance is None:
+        return memory, None
+
+    return memory, float(distance)
 
 
 def build_memory_context_message(
     memories: list[UserMemory],
 ) -> str | None:
-    """Render retrieved memories as a system-message block for the model."""
+    """
+    Convert retrieved memories into a system-message block.
+    """
 
     if not memories:
         return None
@@ -239,27 +314,31 @@ def build_memory_context_message(
 
 
 # ============================================================
-# Memory Extraction (what's worth remembering)
+# Memory Extraction
 # ============================================================
 
 
 _EXTRACTION_SYSTEM_PROMPT = (
-    "You extract durable, reusable facts about a user from a single "
-    "chat exchange, for long-term memory storage.\n\n"
+    "You extract durable, reusable facts about a user from a "
+    "single chat exchange, for long-term memory storage.\n\n"
     "Rules:\n"
     "- Only extract facts that will still be true and useful in "
     "future, unrelated conversations (identity, stated preferences, "
     "stable context like their tech stack, role, or goals).\n"
-    "- Do NOT extract greetings, small talk, one-off questions, or "
-    "anything transient.\n"
-    "- Do NOT extract secrets: API keys, passwords, tokens, or "
-    "payment/card details.\n"
+    "- Do NOT extract greetings, small talk, one-off questions, "
+    "temporary requests, or anything transient.\n"
+    "- Do NOT extract secrets: API keys, passwords, tokens, "
+    "authentication credentials, or payment/card details.\n"
+    "- Do NOT store sensitive information unless it is clearly "
+    "necessary and appropriate as a durable preference/context.\n"
     "- If nothing durable is present, respond with exactly: NONE\n"
     "- Otherwise respond with ONLY a compact JSON object, no other "
-    'text: {"content": "<one durable fact, third person, e.g. '
-    '\'User\'s name is Santanu.\'>", "category": "<short category '
-    'such as identity, preference, project>", "importance": '
-    "<integer 1-10>}"
+    "text:\n"
+    '{"content": "<one durable fact, third person, e.g. '
+    '"User prefers Python for backend development.">, '
+    '"category": "<short category such as identity, preference, '
+    'project>", '
+    '"importance": <integer 1-10>}'
 )
 
 
@@ -268,16 +347,37 @@ async def extract_memory_candidate(
     assistant_message: str,
 ) -> dict | None:
     """
-    Ask the chat model whether the latest exchange contains a durable
-    fact worth remembering. Returns {"content", "category",
-    "importance"} or None. Raises on upstream/Ollama failure; callers
-    are responsible for treating that as non-fatal.
+    Ask the dedicated memory-extraction model whether the latest
+    exchange contains a durable fact worth storing.
+
+    Returns:
+
+        {
+            "content": "...",
+            "category": "...",
+            "importance": 1-10,
+        }
+
+    or None.
+
+    Any Ollama/network exception is allowed to propagate to the
+    caller. Background callers catch it so memory failures never
+    break the completed chat request.
     """
 
+    if not user_message or not user_message.strip():
+        return None
+
+    if not assistant_message or not assistant_message.strip():
+        return None
+
     payload = {
-        "model": CHAT_MODEL,
+        "model": MEMORY_EXTRACTION_MODEL,
         "messages": [
-            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
+            {
+                "role": "system",
+                "content": _EXTRACTION_SYSTEM_PROMPT,
+            },
             {
                 "role": "user",
                 "content": (
@@ -287,7 +387,7 @@ async def extract_memory_candidate(
         ],
         "stream": False,
         "think": False,
-        "keep_alive": "30m",
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "num_ctx": 1024,
             "num_predict": 120,
@@ -296,46 +396,90 @@ async def extract_memory_candidate(
     }
 
     async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        response = await client.post(
+            f"{OLLAMA_URL}/api/chat",
+            json=payload,
+        )
+
         response.raise_for_status()
         data = response.json()
 
     content = ((data.get("message") or {}).get("content") or "").strip()
 
-    if not content or content.upper().startswith("NONE"):
+    if not content:
         return None
 
-    # The model may wrap the JSON in prose or code fences; pull out
-    # the outermost {...} block defensively.
+    if content.upper().startswith("NONE"):
+        return None
+
+    # --------------------------------------------------------
+    # Extract JSON defensively.
+    #
+    # Some small models may return:
+    #
+    # ```json
+    # {...}
+    # ```
+    #
+    # or a short sentence followed by JSON.
+    # --------------------------------------------------------
+
     start = content.find("{")
     end = content.rfind("}")
 
     if start == -1 or end == -1 or end <= start:
+        logger.warning("Memory extraction returned invalid JSON")
         return None
 
     try:
         parsed = json.loads(content[start : end + 1])
-    except ValueError:
+    except (ValueError, TypeError):
+        logger.warning("Memory extraction JSON parsing failed")
         return None
+
+    # --------------------------------------------------------
+    # Content
+    # --------------------------------------------------------
 
     text = str(parsed.get("content") or "").strip()
 
     if not text:
         return None
 
-    importance = parsed.get("importance", DEFAULT_MEMORY_IMPORTANCE)
+    # --------------------------------------------------------
+    # Importance
+    # --------------------------------------------------------
+
+    importance = parsed.get(
+        "importance",
+        DEFAULT_MEMORY_IMPORTANCE,
+    )
 
     try:
         importance = int(importance)
     except (TypeError, ValueError):
         importance = DEFAULT_MEMORY_IMPORTANCE
 
-    importance = max(1, min(10, importance))
+    importance = max(
+        1,
+        min(10, importance),
+    )
+
+    # --------------------------------------------------------
+    # Category
+    # --------------------------------------------------------
 
     category = parsed.get("category")
 
     if category is not None:
-        category = str(category)[:50]
+        category = str(category).strip()[:50]
+
+        if not category:
+            category = None
+
+    # --------------------------------------------------------
+    # Final candidate
+    # --------------------------------------------------------
 
     return {
         "content": text[:4000],
@@ -345,7 +489,7 @@ async def extract_memory_candidate(
 
 
 # ============================================================
-# Limit Enforcement
+# Memory Limit Enforcement
 # ============================================================
 
 
@@ -354,15 +498,22 @@ def enforce_memory_limit(
     api_key: APIKey,
 ) -> None:
     """
-    Ensure the number of stored memories for this key never exceeds
-    its configured memory_limit. Evicts lowest-importance, oldest
-    memories first (never a random pick). memory_limit <= 0 means no
-    memories are retained at all.
+    Ensure stored memories do not exceed api_key.memory_limit.
+
+    Eviction order:
+
+        1. Lowest importance first
+        2. Oldest updated_at first
+        3. Lowest id first as deterministic tie-breaker
+
+    memory_limit <= 0 means that no memories are retained.
     """
 
     limit = api_key.memory_limit or 0
 
-    count = db.query(UserMemory).filter(UserMemory.api_key_id == api_key.id).count()
+    query = db.query(UserMemory).filter(UserMemory.api_key_id == api_key.id)
+
+    count = query.count()
 
     overflow = count - limit
 
@@ -370,11 +521,10 @@ def enforce_memory_limit(
         return
 
     victims = (
-        db.query(UserMemory)
-        .filter(UserMemory.api_key_id == api_key.id)
-        .order_by(
+        query.order_by(
             UserMemory.importance.asc(),
             UserMemory.updated_at.asc(),
+            UserMemory.id.asc(),
         )
         .limit(overflow)
         .all()
@@ -387,7 +537,7 @@ def enforce_memory_limit(
 
 
 # ============================================================
-# Create/Update Memory From a Chat Exchange
+# Create / Update Memory From Chat Exchange
 # ============================================================
 
 
@@ -398,26 +548,71 @@ async def remember_exchange(
     assistant_message: str,
 ) -> None:
     """
-    Best-effort pipeline: decide whether the exchange contains a
-    durable fact, then create or update a memory record for it and
-    enforce memory_limit. Raises on failure - callers that must not
-    let memory issues break a chat response should catch around this.
+    Best-effort long-term memory pipeline.
+
+    Steps:
+
+        1. Check that memory is enabled/configured.
+        2. Ask the extraction model whether the exchange contains
+           a durable fact.
+        3. Generate an embedding for the extracted fact.
+        4. Find an existing near-duplicate.
+        5. Update the duplicate or create a new memory.
+        6. Enforce memory_limit.
+
+    This function itself raises on upstream/database failures.
+    Callers that must not break a chat response should catch the
+    exception.
     """
+
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
 
     if not user_message or not user_message.strip():
         return
 
-    if api_key.memory_limit is not None and api_key.memory_limit <= 0:
+    if not assistant_message or not assistant_message.strip():
         return
 
-    candidate = await extract_memory_candidate(user_message, assistant_message)
+    # --------------------------------------------------------
+    # Memory limit
+    #
+    # 0 means no memories should be retained.
+    # --------------------------------------------------------
+
+    limit = api_key.memory_limit or 0
+
+    if limit <= 0:
+        return
+
+    # --------------------------------------------------------
+    # Extract durable memory candidate
+    # --------------------------------------------------------
+
+    candidate = await extract_memory_candidate(
+        user_message=user_message,
+        assistant_message=assistant_message,
+    )
 
     if candidate is None:
         return
 
+    # --------------------------------------------------------
+    # Generate embedding
+    # --------------------------------------------------------
+
     embedding = await generate_embedding(candidate["content"])
 
-    existing, distance = find_similar_memory(db, api_key.id, embedding)
+    # --------------------------------------------------------
+    # Find near-duplicate
+    # --------------------------------------------------------
+
+    existing, distance = find_similar_memory(
+        db=db,
+        api_key_id=api_key.id,
+        embedding=embedding,
+    )
 
     is_duplicate = (
         existing is not None
@@ -425,13 +620,31 @@ async def remember_exchange(
         and distance <= MEMORY_DEDUP_DISTANCE_THRESHOLD
     )
 
+    # --------------------------------------------------------
+    # Update existing memory
+    # --------------------------------------------------------
+
     if is_duplicate:
         existing.memory = candidate["content"]
-        existing.category = candidate["category"] or existing.category
-        existing.importance = max(existing.importance, candidate["importance"])
+
+        if candidate["category"]:
+            existing.category = candidate["category"]
+
+        # Never reduce the importance of an existing memory.
+        existing.importance = max(
+            existing.importance,
+            candidate["importance"],
+        )
+
         existing.embedding = embedding
         existing.updated_at = datetime.utcnow()
+
         db.commit()
+
+    # --------------------------------------------------------
+    # Create new memory
+    # --------------------------------------------------------
+
     else:
         memory = UserMemory(
             api_key_id=api_key.id,
@@ -440,10 +653,23 @@ async def remember_exchange(
             importance=candidate["importance"],
             embedding=embedding,
         )
+
         db.add(memory)
         db.commit()
 
-    enforce_memory_limit(db, api_key)
+    # --------------------------------------------------------
+    # Enforce configured record limit
+    # --------------------------------------------------------
+
+    enforce_memory_limit(
+        db=db,
+        api_key=api_key,
+    )
+
+
+# ============================================================
+# Background Memory Processing
+# ============================================================
 
 
 async def remember_exchange_background(
@@ -452,9 +678,12 @@ async def remember_exchange_background(
     assistant_message: str,
 ) -> None:
     """
-    Self-contained entry point for use as a FastAPI background task:
-    opens its own short-lived DB session and never raises, so it can
-    run after the chat response has already been sent to the client.
+    FastAPI BackgroundTasks entry point.
+
+    Opens a separate database session and never raises an
+    exception to the client.
+
+    This runs after the chat response has already been returned.
     """
 
     from .database import SessionLocal
@@ -464,10 +693,22 @@ async def remember_exchange_background(
     try:
         api_key = db.query(APIKey).filter(APIKey.id == api_key_id).first()
 
-        if api_key is None or not api_key.memory_enabled:
+        if api_key is None:
+            logger.warning(
+                "Memory processing skipped: api_key_id=%s not found",
+                api_key_id,
+            )
             return
 
-        await remember_exchange(db, api_key, user_message, assistant_message)
+        if not api_key.memory_enabled:
+            return
+
+        await remember_exchange(
+            db=db,
+            api_key=api_key,
+            user_message=user_message,
+            assistant_message=assistant_message,
+        )
 
     except Exception:
         logger.warning(
@@ -487,18 +728,31 @@ async def remember_exchange_background(
 
 @router.get("/v1/memories")
 async def list_memories(
-    limit: int = Query(default=100, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=1000,
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+    ),
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
+    """
+    List long-term memories belonging to the authenticated API key.
+    """
 
     require_memory_enabled(api_key)
 
     query = (
         db.query(UserMemory)
         .filter(UserMemory.api_key_id == api_key.id)
-        .order_by(UserMemory.updated_at.desc())
+        .order_by(
+            UserMemory.updated_at.desc(),
+            UserMemory.id.desc(),
+        )
     )
 
     total = query.count()
@@ -534,6 +788,12 @@ async def delete_memory(
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
+    """
+    Delete one memory.
+
+    The api_key_id condition is mandatory so an API key can never
+    delete another API key's memory.
+    """
 
     require_memory_enabled(api_key)
 
@@ -563,7 +823,7 @@ async def delete_memory(
 
 
 # ============================================================
-# DELETE /v1/memories (clear all)
+# DELETE /v1/memories
 # ============================================================
 
 
@@ -572,6 +832,10 @@ async def clear_memories(
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
+    """
+    Delete all long-term memories belonging to the authenticated
+    API key.
+    """
 
     require_memory_enabled(api_key)
 

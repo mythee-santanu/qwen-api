@@ -1,24 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import (
-    Boolean,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from .database import Base
+
+class Base(DeclarativeBase):
+    pass
 
 
 class APIKey(Base):
     __tablename__ = "api_keys"
 
-    id: Mapped[int] = mapped_column(
-        primary_key=True,
-        autoincrement=True,
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
 
     name: Mapped[str] = mapped_column(
         String(100),
@@ -32,7 +25,7 @@ class APIKey(Base):
     )
 
     key_hash: Mapped[str] = mapped_column(
-        String(64),
+        String(128),
         nullable=False,
         unique=True,
         index=True,
@@ -45,8 +38,6 @@ class APIKey(Base):
         server_default="false",
     )
 
-    # Maximum number of long-term memory records this key may store.
-    # Meaningless (and forced to 0) when memory_enabled is False.
     memory_limit: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
@@ -58,6 +49,8 @@ class APIKey(Base):
         Boolean,
         nullable=False,
         default=True,
+        server_default="true",
+        index=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
@@ -71,13 +64,13 @@ class APIKey(Base):
         nullable=True,
     )
 
-    model_access = relationship(
+    model_access: Mapped[list["APIKeyModelAccess"]] = relationship(
         "APIKeyModelAccess",
         back_populates="api_key",
         cascade="all, delete-orphan",
     )
 
-    usage_records = relationship(
+    usage_records: Mapped[list["APIUsage"]] = relationship(
         "APIUsage",
         back_populates="api_key",
         cascade="all, delete-orphan",
@@ -88,12 +81,17 @@ class APIKeyModelAccess(Base):
     __tablename__ = "api_key_model_access"
 
     id: Mapped[int] = mapped_column(
+        Integer,
         primary_key=True,
-        autoincrement=True,
+        index=True,
     )
 
     api_key_id: Mapped[int] = mapped_column(
-        ForeignKey("api_keys.id", ondelete="CASCADE"),
+        Integer,
+        ForeignKey(
+            "api_keys.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -101,17 +99,15 @@ class APIKeyModelAccess(Base):
     model: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
-        index=True,
     )
 
     enabled: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=True,
+        server_default="true",
     )
 
-    # NULL in database means unlimited.
-    # API accepts the string "unlimited".
     requests_per_minute: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,
@@ -131,27 +127,27 @@ class APIKeyModelAccess(Base):
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
     monthly_tokens_used: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
-    daily_reset_at: Mapped[datetime] = mapped_column(
+    daily_reset_at: Mapped[datetime | None] = mapped_column(
         DateTime,
-        nullable=False,
-        default=datetime.utcnow,
+        nullable=True,
     )
 
-    monthly_reset_at: Mapped[datetime] = mapped_column(
+    monthly_reset_at: Mapped[datetime | None] = mapped_column(
         DateTime,
-        nullable=False,
-        default=datetime.utcnow,
+        nullable=True,
     )
 
-    api_key = relationship(
+    api_key: Mapped["APIKey"] = relationship(
         "APIKey",
         back_populates="model_access",
     )
@@ -161,12 +157,17 @@ class APIUsage(Base):
     __tablename__ = "api_usage"
 
     id: Mapped[int] = mapped_column(
+        Integer,
         primary_key=True,
-        autoincrement=True,
+        index=True,
     )
 
     api_key_id: Mapped[int] = mapped_column(
-        ForeignKey("api_keys.id", ondelete="CASCADE"),
+        Integer,
+        ForeignKey(
+            "api_keys.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -174,7 +175,6 @@ class APIUsage(Base):
     model: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
-        index=True,
     )
 
     endpoint: Mapped[str] = mapped_column(
@@ -186,21 +186,25 @@ class APIUsage(Base):
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
     completion_tokens: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
     total_tokens: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
     response_time_ms: Mapped[float | None] = mapped_column(
+        Float,
         nullable=True,
     )
 
@@ -211,7 +215,7 @@ class APIUsage(Base):
         index=True,
     )
 
-    api_key = relationship(
+    api_key: Mapped["APIKey"] = relationship(
         "APIKey",
         back_populates="usage_records",
     )

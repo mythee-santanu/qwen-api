@@ -4,13 +4,11 @@ import os
 import secrets
 import time
 import uuid
-
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import AsyncGenerator, Literal
 
 import httpx
-
 from fastapi import (
     BackgroundTasks,
     Depends,
@@ -19,17 +17,13 @@ from fastapi import (
     HTTPException,
     status,
 )
-
 from fastapi.responses import StreamingResponse
-
 from pydantic import BaseModel, Field
-
 from sqlalchemy.orm import Session
 
 from .database import Base, engine, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey, APIKeyModelAccess, APIUsage
-
 from .chat_memory import (
     router as chat_memory_router,
     build_memory_context_message,
@@ -38,7 +32,6 @@ from .chat_memory import (
     remember_exchange,
     remember_exchange_background,
 )
-
 from .security import (
     generate_api_key,
     get_key_prefix,
@@ -66,6 +59,8 @@ app = FastAPI(
 )
 
 app.include_router(chat_memory_router)
+
+
 # ============================================================
 # Ollama Configuration
 # ============================================================
@@ -83,7 +78,6 @@ SUPPORTED_CHAT_MODELS = {
 }
 
 EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
-
 EMBEDDING_DIMENSIONS = 1024
 
 
@@ -130,10 +124,9 @@ if not ADMIN_MASTER_KEY:
 # Supported Models
 # ============================================================
 
-SUPPORTED_MODELS = {
-    MODEL_NAME,
-    EMBEDDING_MODEL_NAME,
-}
+# FIX:
+# Include ALL chat models plus the embedding model.
+SUPPORTED_MODELS = SUPPORTED_CHAT_MODELS | {EMBEDDING_MODEL_NAME}
 
 
 # ============================================================
@@ -164,15 +157,28 @@ class ModelLimitRequest(BaseModel):
 
 
 class CreateKeyRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+
     memory_enabled: bool = False
-    memory_limit: int = Field(default=0, ge=0)
+
+    memory_limit: int = Field(
+        default=0,
+        ge=0,
+    )
+
     models: dict[str, ModelLimitRequest] = {}
 
 
 class MemorySettingsUpdateRequest(BaseModel):
     memory_enabled: bool | None = None
-    memory_limit: int | None = Field(default=None, ge=0)
+
+    memory_limit: int | None = Field(
+        default=None,
+        ge=0,
+    )
 
 
 class QuotaUpdateRequest(BaseModel):
@@ -186,7 +192,6 @@ class Message(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
-
     messages: list[Message]
 
     stream: bool = False
@@ -206,7 +211,6 @@ class ChatCompletionRequest(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     model: str
-
     input: str | list[str]
 
 
@@ -276,7 +280,6 @@ def limit_for_response(
 def validate_model_config(
     models: dict[str, ModelLimitRequest],
 ) -> None:
-
     for model, config in models.items():
         if model not in SUPPORTED_MODELS:
             raise HTTPException(
@@ -427,7 +430,7 @@ def check_token_quota(
                 "error": {
                     "message": ("Daily token limit exceeded"),
                     "type": "quota_error",
-                    "code": "daily_token_limit_exceeded",
+                    "code": ("daily_token_limit_exceeded"),
                 }
             },
         )
@@ -441,7 +444,7 @@ def check_token_quota(
                 "error": {
                     "message": ("Monthly token limit exceeded"),
                     "type": "quota_error",
-                    "code": "monthly_token_limit_exceeded",
+                    "code": ("monthly_token_limit_exceeded"),
                 }
             },
         )
@@ -485,8 +488,8 @@ def get_access_response(
     return {
         "model": access.model,
         "enabled": access.enabled,
-        "requests_per_minute": limit_for_response(access.requests_per_minute),
-        "daily_token_limit": limit_for_response(access.daily_token_limit),
+        "requests_per_minute": (limit_for_response(access.requests_per_minute)),
+        "daily_token_limit": (limit_for_response(access.daily_token_limit)),
         "daily_tokens_used": (access.daily_tokens_used),
         "daily_tokens_remaining": (
             "unlimited"
@@ -496,7 +499,7 @@ def get_access_response(
                 access.daily_token_limit - access.daily_tokens_used,
             )
         ),
-        "monthly_token_limit": limit_for_response(access.monthly_token_limit),
+        "monthly_token_limit": (limit_for_response(access.monthly_token_limit)),
         "monthly_tokens_used": (access.monthly_tokens_used),
         "monthly_tokens_remaining": (
             "unlimited"
@@ -520,6 +523,7 @@ async def health():
     return {
         "status": "ok",
         "model": MODEL_NAME,
+        "chat_models": sorted(SUPPORTED_CHAT_MODELS),
         "embedding_model": EMBEDDING_MODEL_NAME,
         "embedding_dimensions": EMBEDDING_DIMENSIONS,
         "version": "3.0.0",
@@ -542,7 +546,8 @@ async def create_api_key(
 
     new_key = generate_api_key()
 
-    # memory_limit is only meaningful when memory is enabled.
+    # memory_limit is only meaningful
+    # when memory is enabled.
     memory_limit = request.memory_limit if request.memory_enabled else 0
 
     db_key = APIKey(
@@ -557,15 +562,22 @@ async def create_api_key(
     db.add(db_key)
     db.flush()
 
-    # If models are omitted, enable both models
-    # with default limits.
+    # ========================================================
+    # FIX:
+    # If models are omitted, enable ALL supported models.
+    #
+    # This gives a new key:
+    # - qwen3.5:0.8b
+    # - qwen3.5:2b
+    # - qwen3-embedding:0.6b
+    # ========================================================
+
     model_configs = request.models
 
     if not model_configs:
-        model_configs = {
-            MODEL_NAME: ModelLimitRequest(),
-            EMBEDDING_MODEL_NAME: ModelLimitRequest(),
-        }
+        model_configs = {model: ModelLimitRequest() for model in SUPPORTED_CHAT_MODELS}
+
+        model_configs[EMBEDDING_MODEL_NAME] = ModelLimitRequest()
 
     for model, config in model_configs.items():
         access = APIKeyModelAccess(
@@ -702,7 +714,7 @@ async def update_key_quota(
         "id": key.id,
         "name": key.name,
         "models": [get_access_response(access) for access in accesses],
-        "message": "Model access and quotas updated",
+        "message": ("Model access and quotas updated"),
     }
 
 
@@ -733,8 +745,8 @@ async def update_key_memory_settings(
     if request.memory_limit is not None:
         key.memory_limit = request.memory_limit
 
-    # memory_limit is meaningless (and forced to 0) whenever memory
-    # is disabled for this key.
+    # memory_limit is meaningless
+    # whenever memory is disabled.
     if not key.memory_enabled:
         key.memory_limit = 0
 
@@ -791,7 +803,7 @@ async def reset_key_usage(
 
 
 # ============================================================
-# Revoke API Key
+# Delete API Key
 # ============================================================
 
 
@@ -801,6 +813,7 @@ async def delete_api_key(
     _: bool = Depends(verify_admin_key),
     db: Session = Depends(get_db),
 ):
+
     key = db.query(APIKey).filter(APIKey.id == key_id).first()
 
     if key is None:
@@ -817,6 +830,7 @@ async def delete_api_key(
         )
 
     # Hard delete.
+    #
     # PostgreSQL CASCADE will also permanently delete:
     # - api_key_model_access
     # - api_usage
@@ -828,7 +842,7 @@ async def delete_api_key(
     return {
         "id": key_id,
         "deleted": True,
-        "message": "API key and all associated data permanently deleted",
+        "message": ("API key and all associated data permanently deleted"),
     }
 
 
@@ -878,9 +892,9 @@ async def get_key_usage(
                 "model": item.model,
                 "endpoint": item.endpoint,
                 "prompt_tokens": item.prompt_tokens,
-                "completion_tokens": item.completion_tokens,
+                "completion_tokens": (item.completion_tokens),
                 "total_tokens": item.total_tokens,
-                "response_time_ms": item.response_time_ms,
+                "response_time_ms": (item.response_time_ms),
                 "created_at": item.created_at,
             }
             for item in usage
@@ -918,9 +932,9 @@ async def get_all_usage(
                 "model": item.model,
                 "endpoint": item.endpoint,
                 "prompt_tokens": item.prompt_tokens,
-                "completion_tokens": item.completion_tokens,
+                "completion_tokens": (item.completion_tokens),
                 "total_tokens": item.total_tokens,
-                "response_time_ms": item.response_time_ms,
+                "response_time_ms": (item.response_time_ms),
                 "created_at": item.created_at,
             }
             for item, key in usage
@@ -970,11 +984,31 @@ def validate_chat_request(
     request: ChatCompletionRequest,
 ) -> None:
 
-    if request.model != MODEL_NAME:
+    # Only supported chat models are accepted.
+    if request.model not in SUPPORTED_CHAT_MODELS:
         raise HTTPException(
             status_code=400,
-            detail=f"Model must be {MODEL_NAME}",
+            detail={
+                "error": {
+                    "message": (
+                        f"Unsupported chat model: "
+                        f"{request.model}. "
+                        f"Supported models: "
+                        f"{', '.join(sorted(SUPPORTED_CHAT_MODELS))}"
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "unsupported_model",
+                }
+            },
         )
+
+    # IMPORTANT:
+    # Do NOT compare request.model to MODEL_NAME here.
+    #
+    # MODEL_NAME is only the default model.
+    #
+    # request.model determines which supported
+    # model the caller actually wants.
 
     if not request.messages:
         raise HTTPException(
@@ -1014,9 +1048,9 @@ def validate_chat_request(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Message at index {index} exceeds "
-                    f"maximum {MAX_MESSAGE_CHARS} "
-                    "characters"
+                    f"Message at index {index} "
+                    f"exceeds maximum "
+                    f"{MAX_MESSAGE_CHARS} characters"
                 ),
             )
 
@@ -1051,9 +1085,11 @@ async def build_memory_context(
     last_user_message: str | None,
 ) -> str | None:
     """
-    Best-effort retrieval of relevant long-term memories for this
-    key. Never raises - a temporary embedding/DB problem should not
-    break a normal chat response.
+    Best-effort retrieval of relevant long-term
+    memories for this key.
+
+    Never raises - a temporary embedding/DB
+    problem should not break a normal chat response.
     """
 
     if not last_user_message:
@@ -1089,6 +1125,7 @@ def build_chat_payload(
     request: ChatCompletionRequest,
     memory_context: str | None = None,
 ) -> dict:
+
     messages = [
         {
             "role": message.role,
@@ -1098,12 +1135,18 @@ def build_chat_payload(
     ]
 
     completion_instruction = (
-        f"Answer the user's request completely and naturally within "
-        f"{request.max_tokens} tokens. Prioritize finishing the answer "
-        "over adding extra detail. Keep the response concise enough to "
-        "reach a complete ending. Do not begin a new section, list item, "
-        "or sentence unless you have enough space to finish it. "
-        "Always aim to end at a natural sentence boundary."
+        f"Answer the user's request completely "
+        f"and naturally within "
+        f"{request.max_tokens} tokens. "
+        "Prioritize finishing the answer "
+        "over adding extra detail. "
+        "Keep the response concise enough "
+        "to reach a complete ending. "
+        "Do not begin a new section, list item, "
+        "or sentence unless you have enough "
+        "space to finish it. "
+        "Always aim to end at a natural "
+        "sentence boundary."
     )
 
     system_additions = completion_instruction
@@ -1113,6 +1156,7 @@ def build_chat_payload(
 
     if messages and messages[0]["role"] == "system":
         messages[0]["content"] += "\n\n" + system_additions
+
     else:
         messages.insert(
             0,
@@ -1123,7 +1167,9 @@ def build_chat_payload(
         )
 
     return {
-        "model": MODEL_NAME,
+        # IMPORTANT:
+        # Use the model requested by the client.
+        "model": request.model,
         "messages": messages,
         "stream": False,
         "think": False,
@@ -1151,10 +1197,13 @@ async def chat_completions(
 
     validate_chat_request(request)
 
+    # IMPORTANT:
+    # Access/quota/rate limit are checked
+    # against the requested model.
     access = get_model_access(
         db,
         api_key,
-        MODEL_NAME,
+        request.model,
     )
 
     check_rate_limit(access)
@@ -1175,10 +1224,13 @@ async def chat_completions(
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
 
     # ========================================================
-    # Memory (MODE 2 only) - retrieval happens before the model
-    # call; creation/update happens after, without blocking the
-    # response. Mode 1 keys (memory_enabled=False) never touch
-    # this at all.
+    # Memory - MODE 2 only
+    #
+    # Retrieval happens before the model call.
+    # Creation/update happens after the response.
+    #
+    # Mode 1 keys (memory_enabled=False)
+    # never touch memory.
     # ========================================================
 
     last_user_message: str | None = None
@@ -1204,8 +1256,8 @@ async def chat_completions(
                 request_id=request_id,
                 api_key_id=api_key.id,
                 memory_context=memory_context,
-                memory_enabled=api_key.memory_enabled,
-                last_user_message=last_user_message,
+                memory_enabled=(api_key.memory_enabled),
+                last_user_message=(last_user_message),
             ),
             media_type="text/event-stream",
             headers={
@@ -1219,7 +1271,10 @@ async def chat_completions(
     # Non-streaming
     # ========================================================
 
-    payload = build_chat_payload(request, memory_context)
+    payload = build_chat_payload(
+        request,
+        memory_context,
+    )
 
     try:
         start_time = time.perf_counter()
@@ -1290,7 +1345,6 @@ async def chat_completions(
         )
 
     message = data.get("message") or {}
-
     content = message.get("content") or ""
 
     if not content:
@@ -1334,19 +1388,20 @@ async def chat_completions(
     access = get_model_access(
         db,
         api_key,
-        MODEL_NAME,
+        request.model,
     )
 
     record_token_usage(
         db=db,
         access=access,
-        model=MODEL_NAME,
+        model=request.model,
         endpoint="/v1/chat/completions",
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         response_time_ms=response_time_ms,
     )
 
+    # Save memory only for memory-enabled keys.
     if api_key.memory_enabled and last_user_message:
         background_tasks.add_task(
             remember_exchange_background,
@@ -1359,7 +1414,9 @@ async def chat_completions(
         "id": request_id,
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": MODEL_NAME,
+        # IMPORTANT:
+        # Return the model actually used.
+        "model": request.model,
         "response_time_ms": response_time_ms,
         "choices": [
             {
@@ -1393,11 +1450,16 @@ async def stream_chat_response(
     last_user_message: str | None = None,
 ) -> AsyncGenerator[str, None]:
 
-    payload = build_chat_payload(request, memory_context)
+    payload = build_chat_payload(
+        request,
+        memory_context,
+    )
+
     payload["stream"] = True
 
     prompt_tokens = 0
     completion_tokens = 0
+
     full_content_parts: list[str] = []
 
     start_time = time.perf_counter()
@@ -1451,7 +1513,9 @@ async def stream_chat_response(
                             "id": request_id,
                             "object": ("chat.completion.chunk"),
                             "created": int(time.time()),
-                            "model": MODEL_NAME,
+                            # FIX:
+                            # Return requested model.
+                            "model": request.model,
                             "choices": [
                                 {
                                     "index": 0,
@@ -1472,7 +1536,8 @@ async def stream_chat_response(
                             "id": request_id,
                             "object": ("chat.completion.chunk"),
                             "created": int(time.time()),
-                            "model": MODEL_NAME,
+                            # FIX:
+                            "model": request.model,
                             "choices": [
                                 {
                                     "index": 0,
@@ -1490,17 +1555,23 @@ async def stream_chat_response(
                             2,
                         )
 
-                        # Create a short-lived DB session.
+                        # Create short-lived DB session.
                         from .database import SessionLocal
 
                         db = SessionLocal()
 
                         try:
+                            # =================================================
+                            # FIX:
+                            # Look up the EXACT requested model.
+                            # Do NOT use MODEL_NAME here.
+                            # =================================================
+
                             access = (
                                 db.query(APIKeyModelAccess)
                                 .filter(
                                     APIKeyModelAccess.api_key_id == api_key_id,
-                                    APIKeyModelAccess.model == MODEL_NAME,
+                                    APIKeyModelAccess.model == request.model,
                                 )
                                 .first()
                             )
@@ -1509,12 +1580,17 @@ async def stream_chat_response(
                                 record_token_usage(
                                     db=db,
                                     access=access,
-                                    model=MODEL_NAME,
+                                    # FIX:
+                                    model=request.model,
                                     endpoint=("/v1/chat/completions"),
                                     prompt_tokens=(prompt_tokens),
                                     completion_tokens=(completion_tokens),
                                     response_time_ms=(response_time_ms),
                                 )
+
+                            # =================================================
+                            # Memory
+                            # =================================================
 
                             if memory_enabled and last_user_message:
                                 full_content = "".join(full_content_parts)
@@ -1540,7 +1616,8 @@ async def stream_chat_response(
 
                                     except Exception:
                                         logger.warning(
-                                            "Memory extraction failed for "
+                                            "Memory extraction "
+                                            "failed for "
                                             "api_key_id=%s",
                                             api_key_id,
                                             exc_info=True,
@@ -1556,7 +1633,7 @@ async def stream_chat_response(
             "error": {
                 "message": (f"Streaming failed: {str(exc)}"),
                 "type": "upstream_error",
-                "code": "ollama_stream_error",
+                "code": ("ollama_stream_error"),
             }
         }
 
@@ -1591,7 +1668,6 @@ async def create_embeddings(
 
     if isinstance(request.input, str):
         inputs = [request.input]
-
     else:
         inputs = request.input
 
@@ -1792,7 +1868,7 @@ async def create_embeddings(
             for index, embedding in enumerate(embeddings)
         ],
         "model": EMBEDDING_MODEL_NAME,
-        "response_time_ms": response_time_ms,
+        "response_time_ms": (response_time_ms),
         "usage": {
             "prompt_tokens": embedding_tokens,
             "total_tokens": embedding_tokens,
@@ -1813,6 +1889,6 @@ async def root():
         "version": "3.0.0",
         "status": "running",
         "chat_model": MODEL_NAME,
+        "chat_models": sorted(SUPPORTED_CHAT_MODELS),
         "embedding_model": (EMBEDDING_MODEL_NAME),
-        "docs": "/docs",
     }
