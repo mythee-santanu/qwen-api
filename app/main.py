@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import secrets
 import time
@@ -11,6 +12,7 @@ from typing import AsyncGenerator, Literal
 import httpx
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     Header,
@@ -30,12 +32,11 @@ from .models import APIKey, APIKeyModelAccess, APIUsage
 
 from .chat_memory import (
     router as chat_memory_router,
-    Conversation,
-    ConversationMessage,
-    UserMemory,
+    build_memory_context_message,
     generate_embedding,
-    load_recent_messages,
     load_relevant_memories,
+    remember_exchange,
+    remember_exchange_background,
 )
 
 from .security import (
@@ -43,6 +44,10 @@ from .security import (
     get_key_prefix,
     hash_api_key,
 )
+
+logger = logging.getLogger(__name__)
+
+
 # ============================================================
 # Database
 # ============================================================
@@ -156,7 +161,13 @@ class ModelLimitRequest(BaseModel):
 class CreateKeyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     memory_enabled: bool = False
+    memory_limit: int = Field(default=0, ge=0)
     models: dict[str, ModelLimitRequest] = {}
+
+
+class MemorySettingsUpdateRequest(BaseModel):
+    memory_enabled: bool | None = None
+    memory_limit: int | None = Field(default=None, ge=0)
 
 
 class QuotaUpdateRequest(BaseModel):
@@ -526,12 +537,16 @@ async def create_api_key(
 
     new_key = generate_api_key()
 
+    # memory_limit is only meaningful when memory is enabled.
+    memory_limit = request.memory_limit if request.memory_enabled else 0
+
     db_key = APIKey(
         name=request.name,
         key_prefix=get_key_prefix(new_key),
         key_hash=hash_api_key(new_key),
         active=True,
         memory_enabled=request.memory_enabled,
+        memory_limit=memory_limit,
     )
 
     db.add(db_key)
@@ -572,6 +587,7 @@ async def create_api_key(
         "api_key": new_key,
         "active": db_key.active,
         "memory_enabled": db_key.memory_enabled,
+        "memory_limit": db_key.memory_limit,
         "models": [get_access_response(access) for access in db_key.model_access],
         "created_at": db_key.created_at,
         "warning": ("Save this API key now. It will not be shown again."),
@@ -606,6 +622,7 @@ async def list_api_keys(
                 "prefix": key.key_prefix,
                 "active": key.active,
                 "memory_enabled": key.memory_enabled,
+                "memory_limit": key.memory_limit,
                 "created_at": key.created_at,
                 "last_used_at": key.last_used_at,
                 "models": [get_access_response(access) for access in key.model_access],
@@ -681,6 +698,49 @@ async def update_key_quota(
         "name": key.name,
         "models": [get_access_response(access) for access in accesses],
         "message": "Model access and quotas updated",
+    }
+
+
+# ============================================================
+# Change Memory Settings
+# ============================================================
+
+
+@app.patch("/v1/keys/{key_id}/memory")
+async def update_key_memory_settings(
+    key_id: int,
+    request: MemorySettingsUpdateRequest,
+    _: bool = Depends(verify_admin_key),
+    db: Session = Depends(get_db),
+):
+
+    key = db.query(APIKey).filter(APIKey.id == key_id).first()
+
+    if key is None:
+        raise HTTPException(
+            status_code=404,
+            detail="API key not found",
+        )
+
+    if request.memory_enabled is not None:
+        key.memory_enabled = request.memory_enabled
+
+    if request.memory_limit is not None:
+        key.memory_limit = request.memory_limit
+
+    # memory_limit is meaningless (and forced to 0) whenever memory
+    # is disabled for this key.
+    if not key.memory_enabled:
+        key.memory_limit = 0
+
+    db.commit()
+    db.refresh(key)
+
+    return {
+        "id": key.id,
+        "memory_enabled": key.memory_enabled,
+        "memory_limit": key.memory_limit,
+        "message": "Memory settings updated",
     }
 
 
@@ -961,12 +1021,64 @@ def validate_chat_request(
 
 
 # ============================================================
+# Memory Helpers
+# ============================================================
+
+
+def get_last_user_message(
+    messages: list[Message],
+) -> str | None:
+
+    for message in reversed(messages):
+        if message.role == "user":
+            return message.content
+
+    return None
+
+
+async def build_memory_context(
+    db: Session,
+    api_key: APIKey,
+    last_user_message: str | None,
+) -> str | None:
+    """
+    Best-effort retrieval of relevant long-term memories for this
+    key. Never raises - a temporary embedding/DB problem should not
+    break a normal chat response.
+    """
+
+    if not last_user_message:
+        return None
+
+    try:
+        query_embedding = await generate_embedding(last_user_message)
+
+        relevant_memories = load_relevant_memories(
+            db,
+            api_key.id,
+            query_embedding,
+        )
+
+        return build_memory_context_message(relevant_memories)
+
+    except Exception:
+        logger.warning(
+            "Memory retrieval failed for api_key_id=%s",
+            api_key.id,
+            exc_info=True,
+        )
+
+        return None
+
+
+# ============================================================
 # Build Ollama Chat Payload
 # ============================================================
 
 
 def build_chat_payload(
     request: ChatCompletionRequest,
+    memory_context: str | None = None,
 ) -> dict:
     messages = [
         {
@@ -985,14 +1097,19 @@ def build_chat_payload(
         "Always aim to end at a natural sentence boundary."
     )
 
+    system_additions = completion_instruction
+
+    if memory_context:
+        system_additions = memory_context + "\n\n" + completion_instruction
+
     if messages and messages[0]["role"] == "system":
-        messages[0]["content"] += "\n\n" + completion_instruction
+        messages[0]["content"] += "\n\n" + system_additions
     else:
         messages.insert(
             0,
             {
                 "role": "system",
-                "content": completion_instruction,
+                "content": system_additions,
             },
         )
 
@@ -1018,6 +1135,7 @@ def build_chat_payload(
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
+    background_tasks: BackgroundTasks,
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
@@ -1048,6 +1166,25 @@ async def chat_completions(
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
 
     # ========================================================
+    # Memory (MODE 2 only) - retrieval happens before the model
+    # call; creation/update happens after, without blocking the
+    # response. Mode 1 keys (memory_enabled=False) never touch
+    # this at all.
+    # ========================================================
+
+    last_user_message: str | None = None
+    memory_context: str | None = None
+
+    if api_key.memory_enabled:
+        last_user_message = get_last_user_message(request.messages)
+
+        memory_context = await build_memory_context(
+            db,
+            api_key,
+            last_user_message,
+        )
+
+    # ========================================================
     # Streaming
     # ========================================================
 
@@ -1057,6 +1194,9 @@ async def chat_completions(
                 request=request,
                 request_id=request_id,
                 api_key_id=api_key.id,
+                memory_context=memory_context,
+                memory_enabled=api_key.memory_enabled,
+                last_user_message=last_user_message,
             ),
             media_type="text/event-stream",
             headers={
@@ -1070,7 +1210,7 @@ async def chat_completions(
     # Non-streaming
     # ========================================================
 
-    payload = build_chat_payload(request)
+    payload = build_chat_payload(request, memory_context)
 
     try:
         start_time = time.perf_counter()
@@ -1198,6 +1338,14 @@ async def chat_completions(
         response_time_ms=response_time_ms,
     )
 
+    if api_key.memory_enabled and last_user_message:
+        background_tasks.add_task(
+            remember_exchange_background,
+            api_key.id,
+            last_user_message,
+            content,
+        )
+
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -1231,13 +1379,17 @@ async def stream_chat_response(
     request: ChatCompletionRequest,
     request_id: str,
     api_key_id: int,
+    memory_context: str | None = None,
+    memory_enabled: bool = False,
+    last_user_message: str | None = None,
 ) -> AsyncGenerator[str, None]:
 
-    payload = build_chat_payload(request)
+    payload = build_chat_payload(request, memory_context)
     payload["stream"] = True
 
     prompt_tokens = 0
     completion_tokens = 0
+    full_content_parts: list[str] = []
 
     start_time = time.perf_counter()
 
@@ -1284,6 +1436,8 @@ async def stream_chat_response(
                     )
 
                     if content:
+                        full_content_parts.append(content)
+
                         chunk = {
                             "id": request_id,
                             "object": ("chat.completion.chunk"),
@@ -1352,6 +1506,36 @@ async def stream_chat_response(
                                     completion_tokens=(completion_tokens),
                                     response_time_ms=(response_time_ms),
                                 )
+
+                            if memory_enabled and last_user_message:
+                                full_content = "".join(full_content_parts)
+
+                                if full_content:
+                                    try:
+                                        stream_api_key = (
+                                            db.query(APIKey)
+                                            .filter(APIKey.id == api_key_id)
+                                            .first()
+                                        )
+
+                                        if (
+                                            stream_api_key is not None
+                                            and stream_api_key.memory_enabled
+                                        ):
+                                            await remember_exchange(
+                                                db,
+                                                stream_api_key,
+                                                last_user_message,
+                                                full_content,
+                                            )
+
+                                    except Exception:
+                                        logger.warning(
+                                            "Memory extraction failed for "
+                                            "api_key_id=%s",
+                                            api_key_id,
+                                            exc_info=True,
+                                        )
 
                         finally:
                             db.close()

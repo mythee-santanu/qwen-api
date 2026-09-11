@@ -45,6 +45,15 @@ class APIKey(Base):
         server_default="false",
     )
 
+    # Maximum number of long-term memory records this key may store.
+    # Meaningless (and forced to 0) when memory_enabled is False.
+    memory_limit: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
     active: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,

@@ -1,4 +1,5 @@
-import uuid
+import json
+import logging
 
 from datetime import datetime
 
@@ -6,10 +7,7 @@ import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from pydantic import BaseModel, Field
-
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from pgvector.sqlalchemy import Vector
@@ -17,6 +15,8 @@ from pgvector.sqlalchemy import Vector
 from .database import Base, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -31,106 +31,26 @@ EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 EMBEDDING_DIMENSIONS = 1024
 
-MAX_HISTORY_MESSAGES = 10
+# How many relevant memories to pull into context per chat request.
+MEMORY_RETRIEVAL_TOP_K = 5
 
-MAX_MEMORY_RESULTS = 5
+# Cosine distance below this value is treated as "the same fact" for
+# dedup/update purposes (0 = identical, 2 = opposite). Kept tight so
+# only near-duplicate facts get merged rather than genuinely new ones.
+MEMORY_DEDUP_DISTANCE_THRESHOLD = 0.15
+
+# Default priority for new memories when the extractor omits one.
+DEFAULT_MEMORY_IMPORTANCE = 5
+
+OLLAMA_TIMEOUT = 120.0
 
 
 router = APIRouter()
 
 
 # ============================================================
-# Database Models
+# Database Model
 # ============================================================
-
-
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
-
-    api_key_id: Mapped[int] = mapped_column(
-        ForeignKey("api_keys.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    title: Mapped[str | None] = mapped_column(
-        String(200),
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-        nullable=False,
-    )
-
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
-
-
-class ConversationMessage(Base):
-    __tablename__ = "conversation_messages"
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        primary_key=True,
-        autoincrement=True,
-    )
-
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    role: Mapped[str] = mapped_column(
-        String(20),
-        nullable=False,
-    )
-
-    content: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
-
-    model: Mapped[str | None] = mapped_column(
-        String(100),
-        nullable=True,
-    )
-
-    prompt_tokens: Mapped[int] = mapped_column(
-        Integer,
-        default=0,
-        nullable=False,
-    )
-
-    completion_tokens: Mapped[int] = mapped_column(
-        Integer,
-        default=0,
-        nullable=False,
-    )
-
-    total_tokens: Mapped[int] = mapped_column(
-        Integer,
-        default=0,
-        nullable=False,
-    )
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-        nullable=False,
-        index=True,
-    )
 
 
 class UserMemory(Base):
@@ -142,6 +62,8 @@ class UserMemory(Base):
         autoincrement=True,
     )
 
+    # Memory belongs directly to the API key. No conversation_id,
+    # no end_user_id - this is the only ownership scope that exists.
     api_key_id: Mapped[int] = mapped_column(
         ForeignKey("api_keys.id", ondelete="CASCADE"),
         nullable=False,
@@ -156,6 +78,15 @@ class UserMemory(Base):
     category: Mapped[str | None] = mapped_column(
         String(50),
         nullable=True,
+    )
+
+    # Higher = more important. Used to decide what survives when
+    # memory_limit is reached.
+    importance: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=DEFAULT_MEMORY_IMPORTANCE,
+        server_default=str(DEFAULT_MEMORY_IMPORTANCE),
     )
 
     embedding: Mapped[list[float] | None] = mapped_column(
@@ -178,72 +109,8 @@ class UserMemory(Base):
 
 
 # ============================================================
-# Request Models
+# Access Control Helper
 # ============================================================
-
-
-class CreateConversationRequest(BaseModel):
-    title: str | None = Field(
-        default=None,
-        max_length=200,
-    )
-
-
-class AddMessageRequest(BaseModel):
-    role: str
-    content: str
-    model: str | None = None
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-    total_tokens: int = 0
-
-
-class CreateMemoryRequest(BaseModel):
-    memory: str = Field(
-        min_length=1,
-        max_length=4000,
-    )
-
-    category: str | None = Field(
-        default=None,
-        max_length=50,
-    )
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-
-def get_owned_conversation(
-    db: Session,
-    api_key_id: int,
-    conversation_id: str,
-) -> Conversation:
-    try:
-        conversation_uuid = uuid.UUID(conversation_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=404,
-            detail="Conversation not found",
-        )
-
-    conversation = (
-        db.query(Conversation)
-        .filter(
-            Conversation.id == conversation_uuid,
-            Conversation.api_key_id == api_key_id,
-        )
-        .first()
-    )
-
-    if conversation is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Conversation not found",
-        )
-
-    return conversation
 
 
 def require_memory_enabled(
@@ -262,10 +129,15 @@ def require_memory_enabled(
         )
 
 
+# ============================================================
+# Embedding
+# ============================================================
+
+
 async def generate_embedding(
     text: str,
 ) -> list[float]:
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/embed",
             json={
@@ -281,61 +153,33 @@ async def generate_embedding(
     embeddings = data.get("embeddings")
 
     if not embeddings:
-        raise HTTPException(
-            status_code=502,
-            detail="Ollama returned an empty embedding",
-        )
+        raise RuntimeError("Ollama returned an empty embedding")
 
     embedding = embeddings[0]
 
     if len(embedding) != EMBEDDING_DIMENSIONS:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": "Invalid embedding dimensions",
-                "expected": EMBEDDING_DIMENSIONS,
-                "actual": len(embedding),
-            },
+        raise RuntimeError(
+            f"Unexpected embedding dimensions: expected "
+            f"{EMBEDDING_DIMENSIONS}, got {len(embedding)}"
         )
 
     return embedding
 
 
-def load_recent_messages(
-    db: Session,
-    conversation_id: str,
-    limit: int = MAX_HISTORY_MESSAGES,
-) -> list[ConversationMessage]:
-
-    try:
-        conversation_uuid = uuid.UUID(conversation_id)
-    except ValueError:
-        return []
-
-    rows = (
-        db.query(ConversationMessage)
-        .filter(ConversationMessage.conversation_id == conversation_uuid)
-        .order_by(
-            ConversationMessage.created_at.desc(),
-            ConversationMessage.id.desc(),
-        )
-        .limit(limit)
-        .all()
-    )
-
-    rows.reverse()
-
-    return rows
+# ============================================================
+# Retrieval
+# ============================================================
 
 
 def load_relevant_memories(
     db: Session,
     api_key_id: int,
     embedding: list[float],
-    limit: int = MAX_MEMORY_RESULTS,
+    limit: int = MEMORY_RETRIEVAL_TOP_K,
 ) -> list[UserMemory]:
+    """Only ever searches memories owned by api_key_id."""
 
-    memories = (
+    return (
         db.query(UserMemory)
         .filter(
             UserMemory.api_key_id == api_key_id,
@@ -346,253 +190,305 @@ def load_relevant_memories(
         .all()
     )
 
-    return memories
 
-
-async def save_memory(
+def find_similar_memory(
     db: Session,
     api_key_id: int,
-    memory_text: str,
-    category: str | None = None,
-) -> UserMemory:
+    embedding: list[float],
+) -> tuple[UserMemory | None, float | None]:
+    """Closest existing memory for this key (if any) and its cosine distance."""
 
-    embedding = await generate_embedding(memory_text)
-
-    memory = UserMemory(
-        api_key_id=api_key_id,
-        memory=memory_text,
-        category=category,
-        embedding=embedding,
+    row = (
+        db.query(
+            UserMemory,
+            UserMemory.embedding.cosine_distance(embedding).label("distance"),
+        )
+        .filter(
+            UserMemory.api_key_id == api_key_id,
+            UserMemory.embedding.isnot(None),
+        )
+        .order_by("distance")
+        .first()
     )
 
-    db.add(memory)
-    db.commit()
-    db.refresh(memory)
+    if row is None:
+        return None, None
 
-    return memory
+    memory, distance = row
 
-
-# ============================================================
-# Create Conversation
-# ============================================================
+    return memory, distance
 
 
-@router.post("/v1/conversations")
-async def create_conversation(
-    request: CreateConversationRequest,
-    api_key: APIKey = Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
-    conversation = Conversation(
-        api_key_id=api_key.id,
-        title=request.title,
+def build_memory_context_message(
+    memories: list[UserMemory],
+) -> str | None:
+    """Render retrieved memories as a system-message block for the model."""
+
+    if not memories:
+        return None
+
+    lines = "\n".join(f"- {item.memory}" for item in memories)
+
+    return (
+        "The following are known long-term facts about this user, "
+        "recalled from previous conversations. Use them only if "
+        "relevant to the current message; do not recite them back "
+        "unless asked.\n"
+        f"{lines}"
     )
 
-    db.add(conversation)
-    db.commit()
-    db.refresh(conversation)
-
-    return {
-        "id": str(conversation.id),
-        "title": conversation.title,
-        "created_at": conversation.created_at,
-        "updated_at": conversation.updated_at,
-    }
-
 
 # ============================================================
-# List Conversations
+# Memory Extraction (what's worth remembering)
 # ============================================================
 
 
-@router.get("/v1/conversations")
-async def list_conversations(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-    api_key: APIKey = Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
+_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract durable, reusable facts about a user from a single "
+    "chat exchange, for long-term memory storage.\n\n"
+    "Rules:\n"
+    "- Only extract facts that will still be true and useful in "
+    "future, unrelated conversations (identity, stated preferences, "
+    "stable context like their tech stack, role, or goals).\n"
+    "- Do NOT extract greetings, small talk, one-off questions, or "
+    "anything transient.\n"
+    "- Do NOT extract secrets: API keys, passwords, tokens, or "
+    "payment/card details.\n"
+    "- If nothing durable is present, respond with exactly: NONE\n"
+    "- Otherwise respond with ONLY a compact JSON object, no other "
+    'text: {"content": "<one durable fact, third person, e.g. '
+    '\'User\'s name is Santanu.\'>", "category": "<short category '
+    'such as identity, preference, project>", "importance": '
+    "<integer 1-10>}"
+)
 
-    query = (
-        db.query(Conversation)
-        .filter(Conversation.api_key_id == api_key.id)
-        .order_by(Conversation.updated_at.desc())
-    )
 
-    total = query.count()
+async def extract_memory_candidate(
+    user_message: str,
+    assistant_message: str,
+) -> dict | None:
+    """
+    Ask the chat model whether the latest exchange contains a durable
+    fact worth remembering. Returns {"content", "category",
+    "importance"} or None. Raises on upstream/Ollama failure; callers
+    are responsible for treating that as non-fatal.
+    """
 
-    conversations = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    total_pages = (total + page_size - 1) // page_size if total else 1
-
-    return {
-        "items": [
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": [
+            {"role": "system", "content": _EXTRACTION_SYSTEM_PROMPT},
             {
-                "id": str(item.id),
-                "title": item.title,
-                "created_at": item.created_at,
-                "updated_at": item.updated_at,
-            }
-            for item in conversations
+                "role": "user",
+                "content": (
+                    f"User said: {user_message}\nAssistant replied: {assistant_message}"
+                ),
+            },
         ],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "total_pages": total_pages,
+        "stream": False,
+        "think": False,
+        "keep_alive": "30m",
+        "options": {
+            "num_ctx": 1024,
+            "num_predict": 120,
+            "temperature": 0.0,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+        response = await client.post(f"{OLLAMA_URL}/api/chat", json=payload)
+        response.raise_for_status()
+        data = response.json()
+
+    content = ((data.get("message") or {}).get("content") or "").strip()
+
+    if not content or content.upper().startswith("NONE"):
+        return None
+
+    # The model may wrap the JSON in prose or code fences; pull out
+    # the outermost {...} block defensively.
+    start = content.find("{")
+    end = content.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    try:
+        parsed = json.loads(content[start : end + 1])
+    except ValueError:
+        return None
+
+    text = str(parsed.get("content") or "").strip()
+
+    if not text:
+        return None
+
+    importance = parsed.get("importance", DEFAULT_MEMORY_IMPORTANCE)
+
+    try:
+        importance = int(importance)
+    except (TypeError, ValueError):
+        importance = DEFAULT_MEMORY_IMPORTANCE
+
+    importance = max(1, min(10, importance))
+
+    category = parsed.get("category")
+
+    if category is not None:
+        category = str(category)[:50]
+
+    return {
+        "content": text[:4000],
+        "category": category,
+        "importance": importance,
     }
 
 
 # ============================================================
-# Conversation Messages
+# Limit Enforcement
 # ============================================================
 
 
-@router.get("/v1/conversations/{conversation_id}/messages")
-async def get_messages(
-    conversation_id: str,
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=100),
-    api_key: APIKey = Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
+def enforce_memory_limit(
+    db: Session,
+    api_key: APIKey,
+) -> None:
+    """
+    Ensure the number of stored memories for this key never exceeds
+    its configured memory_limit. Evicts lowest-importance, oldest
+    memories first (never a random pick). memory_limit <= 0 means no
+    memories are retained at all.
+    """
 
-    conversation = get_owned_conversation(
-        db=db,
-        api_key_id=api_key.id,
-        conversation_id=conversation_id,
-    )
+    limit = api_key.memory_limit or 0
 
-    query = (
-        db.query(ConversationMessage)
-        .filter(ConversationMessage.conversation_id == conversation.id)
+    count = db.query(UserMemory).filter(UserMemory.api_key_id == api_key.id).count()
+
+    overflow = count - limit
+
+    if overflow <= 0:
+        return
+
+    victims = (
+        db.query(UserMemory)
+        .filter(UserMemory.api_key_id == api_key.id)
         .order_by(
-            ConversationMessage.created_at.asc(),
-            ConversationMessage.id.asc(),
+            UserMemory.importance.asc(),
+            UserMemory.updated_at.asc(),
         )
+        .limit(overflow)
+        .all()
     )
 
-    total = query.count()
-
-    messages = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    total_pages = (total + page_size - 1) // page_size if total else 1
-
-    return {
-        "items": [
-            {
-                "id": item.id,
-                "role": item.role,
-                "content": item.content,
-                "model": item.model,
-                "prompt_tokens": item.prompt_tokens,
-                "completion_tokens": item.completion_tokens,
-                "total_tokens": item.total_tokens,
-                "created_at": item.created_at,
-            }
-            for item in messages
-        ],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "total_pages": total_pages,
-    }
-
-
-# ============================================================
-# Add Message Manually
-# ============================================================
-
-
-@router.post("/v1/conversations/{conversation_id}/messages")
-async def add_message(
-    conversation_id: str,
-    request: AddMessageRequest,
-    api_key: APIKey = Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
-
-    conversation = get_owned_conversation(
-        db=db,
-        api_key_id=api_key.id,
-        conversation_id=conversation_id,
-    )
-
-    if request.role not in {
-        "system",
-        "user",
-        "assistant",
-        "tool",
-    }:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid message role",
-        )
-
-    message = ConversationMessage(
-        conversation_id=conversation.id,
-        role=request.role,
-        content=request.content,
-        model=request.model,
-        prompt_tokens=request.prompt_tokens,
-        completion_tokens=request.completion_tokens,
-        total_tokens=request.total_tokens,
-    )
-
-    db.add(message)
-
-    conversation.updated_at = datetime.utcnow()
+    for victim in victims:
+        db.delete(victim)
 
     db.commit()
-    db.refresh(message)
-
-    return {
-        "id": message.id,
-        "conversation_id": str(message.conversation_id),
-        "role": message.role,
-        "content": message.content,
-        "model": message.model,
-        "created_at": message.created_at,
-    }
 
 
 # ============================================================
-# Create Long-Term Memory
+# Create/Update Memory From a Chat Exchange
 # ============================================================
 
 
-@router.post("/v1/memories")
-async def create_memory(
-    request: CreateMemoryRequest,
-    api_key: APIKey = Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
+async def remember_exchange(
+    db: Session,
+    api_key: APIKey,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    """
+    Best-effort pipeline: decide whether the exchange contains a
+    durable fact, then create or update a memory record for it and
+    enforce memory_limit. Raises on failure - callers that must not
+    let memory issues break a chat response should catch around this.
+    """
 
-    require_memory_enabled(api_key)
+    if not user_message or not user_message.strip():
+        return
 
-    memory = await save_memory(
-        db=db,
-        api_key_id=api_key.id,
-        memory_text=request.memory,
-        category=request.category,
+    if api_key.memory_limit is not None and api_key.memory_limit <= 0:
+        return
+
+    candidate = await extract_memory_candidate(user_message, assistant_message)
+
+    if candidate is None:
+        return
+
+    embedding = await generate_embedding(candidate["content"])
+
+    existing, distance = find_similar_memory(db, api_key.id, embedding)
+
+    is_duplicate = (
+        existing is not None
+        and distance is not None
+        and distance <= MEMORY_DEDUP_DISTANCE_THRESHOLD
     )
 
-    return {
-        "id": memory.id,
-        "memory": memory.memory,
-        "category": memory.category,
-        "created_at": memory.created_at,
-    }
+    if is_duplicate:
+        existing.memory = candidate["content"]
+        existing.category = candidate["category"] or existing.category
+        existing.importance = max(existing.importance, candidate["importance"])
+        existing.embedding = embedding
+        existing.updated_at = datetime.utcnow()
+        db.commit()
+    else:
+        memory = UserMemory(
+            api_key_id=api_key.id,
+            memory=candidate["content"],
+            category=candidate["category"],
+            importance=candidate["importance"],
+            embedding=embedding,
+        )
+        db.add(memory)
+        db.commit()
+
+    enforce_memory_limit(db, api_key)
+
+
+async def remember_exchange_background(
+    api_key_id: int,
+    user_message: str,
+    assistant_message: str,
+) -> None:
+    """
+    Self-contained entry point for use as a FastAPI background task:
+    opens its own short-lived DB session and never raises, so it can
+    run after the chat response has already been sent to the client.
+    """
+
+    from .database import SessionLocal
+
+    db = SessionLocal()
+
+    try:
+        api_key = db.query(APIKey).filter(APIKey.id == api_key_id).first()
+
+        if api_key is None or not api_key.memory_enabled:
+            return
+
+        await remember_exchange(db, api_key, user_message, assistant_message)
+
+    except Exception:
+        logger.warning(
+            "Memory extraction failed for api_key_id=%s",
+            api_key_id,
+            exc_info=True,
+        )
+
+    finally:
+        db.close()
 
 
 # ============================================================
-# List Memories
+# GET /v1/memories
 # ============================================================
 
 
 @router.get("/v1/memories")
 async def list_memories(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
@@ -602,35 +498,33 @@ async def list_memories(
     query = (
         db.query(UserMemory)
         .filter(UserMemory.api_key_id == api_key.id)
-        .order_by(UserMemory.created_at.desc())
+        .order_by(UserMemory.updated_at.desc())
     )
 
     total = query.count()
 
-    memories = query.offset((page - 1) * page_size).limit(page_size).all()
-
-    total_pages = (total + page_size - 1) // page_size if total else 1
+    memories = query.offset(offset).limit(limit).all()
 
     return {
-        "items": [
+        "memory_enabled": api_key.memory_enabled,
+        "memory_limit": api_key.memory_limit,
+        "count": total,
+        "memories": [
             {
                 "id": item.id,
-                "memory": item.memory,
+                "content": item.memory,
                 "category": item.category,
+                "importance": item.importance,
                 "created_at": item.created_at,
                 "updated_at": item.updated_at,
             }
             for item in memories
         ],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "total_pages": total_pages,
     }
 
 
 # ============================================================
-# Delete Memory
+# DELETE /v1/memories/{memory_id}
 # ============================================================
 
 
@@ -663,5 +557,32 @@ async def delete_memory(
 
     return {
         "id": memory_id,
+        "deleted": True,
         "message": "Memory deleted",
+    }
+
+
+# ============================================================
+# DELETE /v1/memories (clear all)
+# ============================================================
+
+
+@router.delete("/v1/memories")
+async def clear_memories(
+    api_key: APIKey = Depends(get_current_api_key),
+    db: Session = Depends(get_db),
+):
+
+    require_memory_enabled(api_key)
+
+    deleted = (
+        db.query(UserMemory)
+        .filter(UserMemory.api_key_id == api_key.id)
+        .delete(synchronize_session=False)
+    )
+
+    db.commit()
+
+    return {
+        "deleted": deleted,
     }
