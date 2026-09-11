@@ -4,3 +4,4 @@ httpx
 sqlalchemy
 psycopg[binary]
 python-dotenv
+pgvector

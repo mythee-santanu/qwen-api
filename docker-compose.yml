@@ -1,5 +1,4 @@
 services:
-
   api:
     build: .
     container_name: qwen-api
@@ -46,9 +45,8 @@ services:
       - --workers
       - "1"
 
-
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: qwen-postgres
     restart: unless-stopped
 
@@ -106,7 +104,6 @@ services:
       options:
         max-size: "5m"
         max-file: "3"
-
 
 volumes:
   postgres_data:

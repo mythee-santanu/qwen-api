@@ -791,12 +791,11 @@ async def reset_key_usage(
 
 
 @app.delete("/v1/keys/{key_id}")
-async def revoke_api_key(
+async def delete_api_key(
     key_id: int,
     _: bool = Depends(verify_admin_key),
     db: Session = Depends(get_db),
 ):
-
     key = db.query(APIKey).filter(APIKey.id == key_id).first()
 
     if key is None:
@@ -805,21 +804,26 @@ async def revoke_api_key(
             detail="API key not found",
         )
 
-    key.active = False
-
-    db.commit()
-
-    # Remove in-memory rate limit state
+    # Remove in-memory rate-limit state.
     for model in SUPPORTED_MODELS:
         _rate_limit_store.pop(
             (key.id, model),
             None,
         )
 
+    # Hard delete.
+    # PostgreSQL CASCADE will also permanently delete:
+    # - api_key_model_access
+    # - api_usage
+    # - conversations
+    # - user_memories
+    db.delete(key)
+    db.commit()
+
     return {
-        "id": key.id,
-        "active": False,
-        "message": "API key revoked",
+        "id": key_id,
+        "deleted": True,
+        "message": "API key and all associated data permanently deleted",
     }
 
 
