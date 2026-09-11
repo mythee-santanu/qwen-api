@@ -77,6 +77,11 @@ OLLAMA_URL = os.getenv(
 
 MODEL_NAME = "qwen3.5:0.8b"
 
+SUPPORTED_CHAT_MODELS = {
+    "qwen3.5:0.8b",
+    "qwen3.5:2b",
+}
+
 EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
 
 EMBEDDING_DIMENSIONS = 1024
