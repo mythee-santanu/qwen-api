@@ -9,8 +9,6 @@ from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
 from pgvector.sqlalchemy import Vector
 
-from pgvector.sqlalchemy import Vector
-
 from .database import Base, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey
@@ -50,12 +48,6 @@ class Conversation(Base):
 
     api_key_id: Mapped[int] = mapped_column(
         ForeignKey("api_keys.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    end_user_id: Mapped[str] = mapped_column(
-        String(100),
         nullable=False,
         index=True,
     )
@@ -149,12 +141,6 @@ class UserMemory(Base):
         index=True,
     )
 
-    end_user_id: Mapped[str] = mapped_column(
-        String(100),
-        nullable=False,
-        index=True,
-    )
-
     memory: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -190,11 +176,6 @@ class UserMemory(Base):
 
 
 class CreateConversationRequest(BaseModel):
-    end_user_id: str = Field(
-        min_length=1,
-        max_length=100,
-    )
-
     title: str | None = Field(
         default=None,
         max_length=200,
@@ -212,11 +193,6 @@ class AddMessageRequest(BaseModel):
 
 
 class CreateMemoryRequest(BaseModel):
-    end_user_id: str = Field(
-        min_length=1,
-        max_length=100,
-    )
-
     memory: str = Field(
         min_length=1,
         max_length=4000,
@@ -237,18 +213,16 @@ def get_owned_conversation(
     db: Session,
     api_key_id: int,
     conversation_id: str,
-    end_user_id: str | None = None,
 ) -> Conversation:
 
-    query = db.query(Conversation).filter(
-        Conversation.id == conversation_id,
-        Conversation.api_key_id == api_key_id,
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.id == conversation_id,
+            Conversation.api_key_id == api_key_id,
+        )
+        .first()
     )
-
-    if end_user_id is not None:
-        query = query.filter(Conversation.end_user_id == end_user_id)
-
-    conversation = query.first()
 
     if conversation is None:
         raise HTTPException(
@@ -257,6 +231,23 @@ def get_owned_conversation(
         )
 
     return conversation
+
+
+def require_memory_enabled(
+    api_key: APIKey,
+) -> None:
+
+    if not api_key.memory_enabled:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": {
+                    "message": ("Memory is not enabled for this API key"),
+                    "type": "memory_access_error",
+                    "code": "memory_not_enabled",
+                }
+            },
+        )
 
 
 async def generate_embedding(
@@ -324,7 +315,6 @@ def load_recent_messages(
 def load_relevant_memories(
     db: Session,
     api_key_id: int,
-    end_user_id: str,
     embedding: list[float],
     limit: int = MAX_MEMORY_RESULTS,
 ) -> list[UserMemory]:
@@ -333,7 +323,6 @@ def load_relevant_memories(
         db.query(UserMemory)
         .filter(
             UserMemory.api_key_id == api_key_id,
-            UserMemory.end_user_id == end_user_id,
             UserMemory.embedding.isnot(None),
         )
         .order_by(UserMemory.embedding.cosine_distance(embedding))
@@ -347,7 +336,6 @@ def load_relevant_memories(
 async def save_memory(
     db: Session,
     api_key_id: int,
-    end_user_id: str,
     memory_text: str,
     category: str | None = None,
 ) -> UserMemory:
@@ -356,7 +344,6 @@ async def save_memory(
 
     memory = UserMemory(
         api_key_id=api_key_id,
-        end_user_id=end_user_id,
         memory=memory_text,
         category=category,
         embedding=embedding,
@@ -384,7 +371,6 @@ async def create_conversation(
     conversation = Conversation(
         id=str(uuid.uuid4()),
         api_key_id=api_key.id,
-        end_user_id=request.end_user_id,
         title=request.title,
     )
 
@@ -394,7 +380,6 @@ async def create_conversation(
 
     return {
         "id": conversation.id,
-        "end_user_id": conversation.end_user_id,
         "title": conversation.title,
         "created_at": conversation.created_at,
         "updated_at": conversation.updated_at,
@@ -408,7 +393,6 @@ async def create_conversation(
 
 @router.get("/v1/conversations")
 async def list_conversations(
-    end_user_id: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     api_key: APIKey = Depends(get_current_api_key),
@@ -417,10 +401,7 @@ async def list_conversations(
 
     query = (
         db.query(Conversation)
-        .filter(
-            Conversation.api_key_id == api_key.id,
-            Conversation.end_user_id == end_user_id,
-        )
+        .filter(Conversation.api_key_id == api_key.id)
         .order_by(Conversation.updated_at.desc())
     )
 
@@ -434,7 +415,6 @@ async def list_conversations(
         "items": [
             {
                 "id": item.id,
-                "end_user_id": item.end_user_id,
                 "title": item.title,
                 "created_at": item.created_at,
                 "updated_at": item.updated_at,
@@ -458,7 +438,6 @@ async def get_messages(
     conversation_id: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
-    end_user_id: str | None = None,
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
@@ -467,7 +446,6 @@ async def get_messages(
         db=db,
         api_key_id=api_key.id,
         conversation_id=conversation_id,
-        end_user_id=end_user_id,
     )
 
     query = (
@@ -503,7 +481,6 @@ async def get_messages(
         "page_size": page_size,
         "total": total,
         "total_pages": total_pages,
-        "end_user_id": conversation.end_user_id,
     }
 
 
@@ -576,17 +553,17 @@ async def create_memory(
     db: Session = Depends(get_db),
 ):
 
+    require_memory_enabled(api_key)
+
     memory = await save_memory(
         db=db,
         api_key_id=api_key.id,
-        end_user_id=request.end_user_id,
         memory_text=request.memory,
         category=request.category,
     )
 
     return {
         "id": memory.id,
-        "end_user_id": memory.end_user_id,
         "memory": memory.memory,
         "category": memory.category,
         "created_at": memory.created_at,
@@ -600,19 +577,17 @@ async def create_memory(
 
 @router.get("/v1/memories")
 async def list_memories(
-    end_user_id: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
+    require_memory_enabled(api_key)
+
     query = (
         db.query(UserMemory)
-        .filter(
-            UserMemory.api_key_id == api_key.id,
-            UserMemory.end_user_id == end_user_id,
-        )
+        .filter(UserMemory.api_key_id == api_key.id)
         .order_by(UserMemory.created_at.desc())
     )
 
@@ -651,6 +626,8 @@ async def delete_memory(
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
+
+    require_memory_enabled(api_key)
 
     memory = (
         db.query(UserMemory)

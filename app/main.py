@@ -27,7 +27,6 @@ from sqlalchemy.orm import Session
 from .database import Base, engine, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey, APIKeyModelAccess, APIUsage
-from .chat_memory import router as chat_memory_router
 
 from .chat_memory import (
     router as chat_memory_router,
