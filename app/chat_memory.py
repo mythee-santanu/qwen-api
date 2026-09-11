@@ -1,12 +1,17 @@
 import uuid
+
 from datetime import datetime
 
 import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+
 from pydantic import BaseModel, Field
+
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, Session, mapped_column
+
 from pgvector.sqlalchemy import Vector
 
 from .database import Base, get_db
@@ -21,11 +26,13 @@ from .models import APIKey
 OLLAMA_URL = "http://host.docker.internal:11434"
 
 CHAT_MODEL = "qwen3.5:0.8b"
+
 EMBEDDING_MODEL = "qwen3-embedding:0.6b"
 
 EMBEDDING_DIMENSIONS = 1024
 
 MAX_HISTORY_MESSAGES = 10
+
 MAX_MEMORY_RESULTS = 5
 
 
@@ -40,10 +47,10 @@ router = APIRouter()
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    id: Mapped[str] = mapped_column(
-        String(36),
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
         primary_key=True,
-        default=lambda: str(uuid.uuid4()),
+        default=uuid.uuid4,
     )
 
     api_key_id: Mapped[int] = mapped_column(
@@ -79,7 +86,7 @@ class ConversationMessage(Base):
         autoincrement=True,
     )
 
-    conversation_id: Mapped[str] = mapped_column(
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
@@ -186,7 +193,6 @@ class AddMessageRequest(BaseModel):
     role: str
     content: str
     model: str | None = None
-
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
@@ -214,11 +220,18 @@ def get_owned_conversation(
     api_key_id: int,
     conversation_id: str,
 ) -> Conversation:
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail="Conversation not found",
+        )
 
     conversation = (
         db.query(Conversation)
         .filter(
-            Conversation.id == conversation_id,
+            Conversation.id == conversation_uuid,
             Conversation.api_key_id == api_key_id,
         )
         .first()
@@ -236,13 +249,12 @@ def get_owned_conversation(
 def require_memory_enabled(
     api_key: APIKey,
 ) -> None:
-
     if not api_key.memory_enabled:
         raise HTTPException(
             status_code=403,
             detail={
                 "error": {
-                    "message": ("Memory is not enabled for this API key"),
+                    "message": "Memory is not enabled for this API key",
                     "type": "memory_access_error",
                     "code": "memory_not_enabled",
                 }
@@ -253,7 +265,6 @@ def require_memory_enabled(
 async def generate_embedding(
     text: str,
 ) -> list[float]:
-
     async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/embed",
@@ -296,9 +307,14 @@ def load_recent_messages(
     limit: int = MAX_HISTORY_MESSAGES,
 ) -> list[ConversationMessage]:
 
+    try:
+        conversation_uuid = uuid.UUID(conversation_id)
+    except ValueError:
+        return []
+
     rows = (
         db.query(ConversationMessage)
-        .filter(ConversationMessage.conversation_id == conversation_id)
+        .filter(ConversationMessage.conversation_id == conversation_uuid)
         .order_by(
             ConversationMessage.created_at.desc(),
             ConversationMessage.id.desc(),
@@ -367,9 +383,7 @@ async def create_conversation(
     api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
-
     conversation = Conversation(
-        id=str(uuid.uuid4()),
         api_key_id=api_key.id,
         title=request.title,
     )
@@ -379,7 +393,7 @@ async def create_conversation(
     db.refresh(conversation)
 
     return {
-        "id": conversation.id,
+        "id": str(conversation.id),
         "title": conversation.title,
         "created_at": conversation.created_at,
         "updated_at": conversation.updated_at,
@@ -414,7 +428,7 @@ async def list_conversations(
     return {
         "items": [
             {
-                "id": item.id,
+                "id": str(item.id),
                 "title": item.title,
                 "created_at": item.created_at,
                 "updated_at": item.updated_at,
@@ -533,7 +547,7 @@ async def add_message(
 
     return {
         "id": message.id,
-        "conversation_id": message.conversation_id,
+        "conversation_id": str(message.conversation_id),
         "role": message.role,
         "content": message.content,
         "model": message.model,
