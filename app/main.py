@@ -126,6 +126,13 @@ if not ADMIN_MASTER_KEY:
 
 # FIX:
 # Include ALL chat models plus the embedding model.
+SUPPORTED_CHAT_MODELS = {
+    "qwen3.5:0.8b",
+    "qwen3.5:2b",
+}
+
+EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
+
 SUPPORTED_MODELS = SUPPORTED_CHAT_MODELS | {EMBEDDING_MODEL_NAME}
 
 
