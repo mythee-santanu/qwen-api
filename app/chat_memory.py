@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
+from pgvector.sqlalchemy import Vector
 
 from pgvector.sqlalchemy import Vector
 
@@ -61,7 +62,6 @@ class Conversation(Base):
 
     title: Mapped[str | None] = mapped_column(
         String(200),
-        nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
