@@ -28,13 +28,22 @@ from .database import Base, engine, get_db
 from .dependencies import get_current_api_key
 from .models import APIKey, APIKeyModelAccess, APIUsage
 from .chat_memory import router as chat_memory_router
+
+from .chat_memory import (
+    router as chat_memory_router,
+    Conversation,
+    ConversationMessage,
+    UserMemory,
+    generate_embedding,
+    load_recent_messages,
+    load_relevant_memories,
+)
+
 from .security import (
     generate_api_key,
     get_key_prefix,
     hash_api_key,
 )
-
-
 # ============================================================
 # Database
 # ============================================================
@@ -146,11 +155,8 @@ class ModelLimitRequest(BaseModel):
 
 
 class CreateKeyRequest(BaseModel):
-    name: str = Field(
-        min_length=1,
-        max_length=100,
-    )
-
+    name: str = Field(min_length=1, max_length=100)
+    memory_enabled: bool = False
     models: dict[str, ModelLimitRequest] = {}
 
 
@@ -526,6 +532,7 @@ async def create_api_key(
         key_prefix=get_key_prefix(new_key),
         key_hash=hash_api_key(new_key),
         active=True,
+        memory_enabled=request.memory_enabled,
     )
 
     db.add(db_key)
@@ -565,6 +572,7 @@ async def create_api_key(
         "name": db_key.name,
         "api_key": new_key,
         "active": db_key.active,
+        "memory_enabled": db_key.memory_enabled,
         "models": [get_access_response(access) for access in db_key.model_access],
         "created_at": db_key.created_at,
         "warning": ("Save this API key now. It will not be shown again."),
@@ -598,6 +606,7 @@ async def list_api_keys(
                 "name": key.name,
                 "prefix": key.key_prefix,
                 "active": key.active,
+                "memory_enabled": key.memory_enabled,
                 "created_at": key.created_at,
                 "last_used_at": key.last_used_at,
                 "models": [get_access_response(access) for access in key.model_access],

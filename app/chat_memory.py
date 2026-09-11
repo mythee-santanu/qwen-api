@@ -1,29 +1,18 @@
-import math
 import uuid
 from datetime import datetime
 
 import httpx
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import (
-    BigInteger,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    func,
-)
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, Session, mapped_column
+
+from pgvector.sqlalchemy import Vector
 
 from .database import Base, get_db
 from .dependencies import get_current_api_key
-
-
-router = APIRouter(
-    prefix="/v1",
-    tags=["Chat Memory"],
-)
+from .models import APIKey
 
 
 # ============================================================
@@ -32,11 +21,16 @@ router = APIRouter(
 
 OLLAMA_URL = "http://host.docker.internal:11434"
 
-EMBEDDING_MODEL_NAME = "qwen3-embedding:0.6b"
+CHAT_MODEL = "qwen3.5:0.8b"
+EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+
 EMBEDDING_DIMENSIONS = 1024
 
-OLLAMA_TIMEOUT = 300.0
-OLLAMA_KEEP_ALIVE = "30m"
+MAX_HISTORY_MESSAGES = 10
+MAX_MEMORY_RESULTS = 5
+
+
+router = APIRouter()
 
 
 # ============================================================
@@ -47,16 +41,14 @@ OLLAMA_KEEP_ALIVE = "30m"
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    id: Mapped[uuid.UUID] = mapped_column(
+    id: Mapped[str] = mapped_column(
+        String(36),
         primary_key=True,
-        default=uuid.uuid4,
+        default=lambda: str(uuid.uuid4()),
     )
 
     api_key_id: Mapped[int] = mapped_column(
-        ForeignKey(
-            "api_keys.id",
-            ondelete="CASCADE",
-        ),
+        ForeignKey("api_keys.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -68,21 +60,21 @@ class Conversation(Base):
     )
 
     title: Mapped[str | None] = mapped_column(
-        String(255),
+        String(200),
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        nullable=False,
         default=datetime.utcnow,
+        nullable=False,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        nullable=False,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
+        nullable=False,
     )
 
 
@@ -90,16 +82,13 @@ class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
 
-    conversation_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey(
-            "conversations.id",
-            ondelete="CASCADE",
-        ),
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -121,26 +110,26 @@ class ConversationMessage(Base):
 
     prompt_tokens: Mapped[int] = mapped_column(
         Integer,
-        nullable=False,
         default=0,
+        nullable=False,
     )
 
     completion_tokens: Mapped[int] = mapped_column(
         Integer,
-        nullable=False,
         default=0,
+        nullable=False,
     )
 
     total_tokens: Mapped[int] = mapped_column(
         Integer,
-        nullable=False,
         default=0,
+        nullable=False,
     )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        nullable=False,
         default=datetime.utcnow,
+        nullable=False,
         index=True,
     )
 
@@ -149,16 +138,13 @@ class UserMemory(Base):
     __tablename__ = "user_memories"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        Integer,
         primary_key=True,
         autoincrement=True,
     )
 
     api_key_id: Mapped[int] = mapped_column(
-        ForeignKey(
-            "api_keys.id",
-            ondelete="CASCADE",
-        ),
+        ForeignKey("api_keys.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
@@ -179,23 +165,22 @@ class UserMemory(Base):
         nullable=True,
     )
 
-    # Stored as PostgreSQL vector(1024).
-    # Actual column is created by SQL migration below.
-    embedding = mapped_column(
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(EMBEDDING_DIMENSIONS),
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        nullable=False,
         default=datetime.utcnow,
+        nullable=False,
     )
 
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        nullable=False,
         default=datetime.utcnow,
         onupdate=datetime.utcnow,
+        nullable=False,
     )
 
 
@@ -212,17 +197,13 @@ class CreateConversationRequest(BaseModel):
 
     title: str | None = Field(
         default=None,
-        max_length=255,
+        max_length=200,
     )
 
 
-class CreateMessageRequest(BaseModel):
+class AddMessageRequest(BaseModel):
     role: str
-    content: str = Field(
-        min_length=1,
-        max_length=16000,
-    )
-
+    content: str
     model: str | None = None
 
     prompt_tokens: int = 0
@@ -238,7 +219,7 @@ class CreateMemoryRequest(BaseModel):
 
     memory: str = Field(
         min_length=1,
-        max_length=5000,
+        max_length=4000,
     )
 
     category: str | None = Field(
@@ -252,20 +233,22 @@ class CreateMemoryRequest(BaseModel):
 # ============================================================
 
 
-def get_conversation_for_user(
+def get_owned_conversation(
     db: Session,
     api_key_id: int,
-    conversation_id: uuid.UUID,
+    conversation_id: str,
+    end_user_id: str | None = None,
 ) -> Conversation:
 
-    conversation = (
-        db.query(Conversation)
-        .filter(
-            Conversation.id == conversation_id,
-            Conversation.api_key_id == api_key_id,
-        )
-        .first()
+    query = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.api_key_id == api_key_id,
     )
+
+    if end_user_id is not None:
+        query = query.filter(Conversation.end_user_id == end_user_id)
+
+    conversation = query.first()
 
     if conversation is None:
         raise HTTPException(
@@ -276,17 +259,16 @@ def get_conversation_for_user(
     return conversation
 
 
-async def create_embedding(
+async def generate_embedding(
     text: str,
 ) -> list[float]:
 
-    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/embed",
             json={
-                "model": EMBEDDING_MODEL_NAME,
+                "model": EMBEDDING_MODEL,
                 "input": text,
-                "keep_alive": OLLAMA_KEEP_ALIVE,
             },
         )
 
@@ -307,27 +289,100 @@ async def create_embedding(
     if len(embedding) != EMBEDDING_DIMENSIONS:
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Expected {EMBEDDING_DIMENSIONS} dimensions, got {len(embedding)}"
-            ),
+            detail={
+                "error": "Invalid embedding dimensions",
+                "expected": EMBEDDING_DIMENSIONS,
+                "actual": len(embedding),
+            },
         )
 
     return embedding
 
 
+def load_recent_messages(
+    db: Session,
+    conversation_id: str,
+    limit: int = MAX_HISTORY_MESSAGES,
+) -> list[ConversationMessage]:
+
+    rows = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.conversation_id == conversation_id)
+        .order_by(
+            ConversationMessage.created_at.desc(),
+            ConversationMessage.id.desc(),
+        )
+        .limit(limit)
+        .all()
+    )
+
+    rows.reverse()
+
+    return rows
+
+
+def load_relevant_memories(
+    db: Session,
+    api_key_id: int,
+    end_user_id: str,
+    embedding: list[float],
+    limit: int = MAX_MEMORY_RESULTS,
+) -> list[UserMemory]:
+
+    memories = (
+        db.query(UserMemory)
+        .filter(
+            UserMemory.api_key_id == api_key_id,
+            UserMemory.end_user_id == end_user_id,
+            UserMemory.embedding.isnot(None),
+        )
+        .order_by(UserMemory.embedding.cosine_distance(embedding))
+        .limit(limit)
+        .all()
+    )
+
+    return memories
+
+
+async def save_memory(
+    db: Session,
+    api_key_id: int,
+    end_user_id: str,
+    memory_text: str,
+    category: str | None = None,
+) -> UserMemory:
+
+    embedding = await generate_embedding(memory_text)
+
+    memory = UserMemory(
+        api_key_id=api_key_id,
+        end_user_id=end_user_id,
+        memory=memory_text,
+        category=category,
+        embedding=embedding,
+    )
+
+    db.add(memory)
+    db.commit()
+    db.refresh(memory)
+
+    return memory
+
+
 # ============================================================
-# Conversations
+# Create Conversation
 # ============================================================
 
 
-@router.post("/conversations")
-def create_conversation(
+@router.post("/v1/conversations")
+async def create_conversation(
     request: CreateConversationRequest,
-    api_key=Depends(get_current_api_key),
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
     conversation = Conversation(
+        id=str(uuid.uuid4()),
         api_key_id=api_key.id,
         end_user_id=request.end_user_id,
         title=request.title,
@@ -338,7 +393,7 @@ def create_conversation(
     db.refresh(conversation)
 
     return {
-        "id": str(conversation.id),
+        "id": conversation.id,
         "end_user_id": conversation.end_user_id,
         "title": conversation.title,
         "created_at": conversation.created_at,
@@ -346,43 +401,39 @@ def create_conversation(
     }
 
 
-@router.get("/conversations")
-def list_conversations(
-    end_user_id: str | None = None,
-    page: int = Query(
-        default=1,
-        ge=1,
-    ),
-    page_size: int = Query(
-        default=20,
-        ge=1,
-        le=100,
-    ),
-    api_key=Depends(get_current_api_key),
+# ============================================================
+# List Conversations
+# ============================================================
+
+
+@router.get("/v1/conversations")
+async def list_conversations(
+    end_user_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
-    query = db.query(Conversation).filter(Conversation.api_key_id == api_key.id)
-
-    if end_user_id is not None:
-        query = query.filter(Conversation.end_user_id == end_user_id)
+    query = (
+        db.query(Conversation)
+        .filter(
+            Conversation.api_key_id == api_key.id,
+            Conversation.end_user_id == end_user_id,
+        )
+        .order_by(Conversation.updated_at.desc())
+    )
 
     total = query.count()
 
-    conversations = (
-        query.order_by(
-            Conversation.updated_at.desc(),
-            Conversation.id.desc(),
-        )
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
+    conversations = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    total_pages = (total + page_size - 1) // page_size if total else 1
 
     return {
         "items": [
             {
-                "id": str(item.id),
+                "id": item.id,
                 "end_user_id": item.end_user_id,
                 "title": item.title,
                 "created_at": item.created_at,
@@ -393,29 +444,7 @@ def list_conversations(
         "page": page,
         "page_size": page_size,
         "total": total,
-        "total_pages": math.ceil(total / page_size) if total else 0,
-    }
-
-
-@router.delete("/conversations/{conversation_id}")
-def delete_conversation(
-    conversation_id: uuid.UUID,
-    api_key=Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
-
-    conversation = get_conversation_for_user(
-        db,
-        api_key.id,
-        conversation_id,
-    )
-
-    db.delete(conversation)
-    db.commit()
-
-    return {
-        "message": "Conversation deleted",
-        "id": str(conversation_id),
+        "total_pages": total_pages,
     }
 
 
@@ -424,28 +453,85 @@ def delete_conversation(
 # ============================================================
 
 
-@router.post("/conversations/{conversation_id}/messages")
-def create_message(
-    conversation_id: uuid.UUID,
-    request: CreateMessageRequest,
-    api_key=Depends(get_current_api_key),
+@router.get("/v1/conversations/{conversation_id}/messages")
+async def get_messages(
+    conversation_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    end_user_id: str | None = None,
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
-    conversation = get_conversation_for_user(
-        db,
-        api_key.id,
-        conversation_id,
+    conversation = get_owned_conversation(
+        db=db,
+        api_key_id=api_key.id,
+        conversation_id=conversation_id,
+        end_user_id=end_user_id,
     )
 
-    allowed_roles = {
+    query = (
+        db.query(ConversationMessage)
+        .filter(ConversationMessage.conversation_id == conversation.id)
+        .order_by(
+            ConversationMessage.created_at.asc(),
+            ConversationMessage.id.asc(),
+        )
+    )
+
+    total = query.count()
+
+    messages = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    total_pages = (total + page_size - 1) // page_size if total else 1
+
+    return {
+        "items": [
+            {
+                "id": item.id,
+                "role": item.role,
+                "content": item.content,
+                "model": item.model,
+                "prompt_tokens": item.prompt_tokens,
+                "completion_tokens": item.completion_tokens,
+                "total_tokens": item.total_tokens,
+                "created_at": item.created_at,
+            }
+            for item in messages
+        ],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "end_user_id": conversation.end_user_id,
+    }
+
+
+# ============================================================
+# Add Message Manually
+# ============================================================
+
+
+@router.post("/v1/conversations/{conversation_id}/messages")
+async def add_message(
+    conversation_id: str,
+    request: AddMessageRequest,
+    api_key: APIKey = Depends(get_current_api_key),
+    db: Session = Depends(get_db),
+):
+
+    conversation = get_owned_conversation(
+        db=db,
+        api_key_id=api_key.id,
+        conversation_id=conversation_id,
+    )
+
+    if request.role not in {
         "system",
         "user",
         "assistant",
         "tool",
-    }
-
-    if request.role not in allowed_roles:
+    }:
         raise HTTPException(
             status_code=400,
             detail="Invalid message role",
@@ -470,7 +556,7 @@ def create_message(
 
     return {
         "id": message.id,
-        "conversation_id": str(message.conversation_id),
+        "conversation_id": message.conversation_id,
         "role": message.role,
         "content": message.content,
         "model": message.model,
@@ -478,91 +564,25 @@ def create_message(
     }
 
 
-@router.get("/conversations/{conversation_id}/messages")
-def list_messages(
-    conversation_id: uuid.UUID,
-    page: int = Query(
-        default=1,
-        ge=1,
-    ),
-    page_size: int = Query(
-        default=50,
-        ge=1,
-        le=100,
-    ),
-    api_key=Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
-
-    conversation = get_conversation_for_user(
-        db,
-        api_key.id,
-        conversation_id,
-    )
-
-    query = db.query(ConversationMessage).filter(
-        ConversationMessage.conversation_id == conversation.id
-    )
-
-    total = query.count()
-
-    messages = (
-        query.order_by(
-            ConversationMessage.created_at.asc(),
-            ConversationMessage.id.asc(),
-        )
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-
-    return {
-        "items": [
-            {
-                "id": item.id,
-                "role": item.role,
-                "content": item.content,
-                "model": item.model,
-                "prompt_tokens": item.prompt_tokens,
-                "completion_tokens": item.completion_tokens,
-                "total_tokens": item.total_tokens,
-                "created_at": item.created_at,
-            }
-            for item in messages
-        ],
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "total_pages": math.ceil(total / page_size) if total else 0,
-        "end_user_id": conversation.end_user_id,
-    }
-
-
 # ============================================================
-# Long-Term Memory
+# Create Long-Term Memory
 # ============================================================
 
 
-@router.post("/memories")
+@router.post("/v1/memories")
 async def create_memory(
     request: CreateMemoryRequest,
-    api_key=Depends(get_current_api_key),
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
-    embedding = await create_embedding(request.memory)
-
-    memory = UserMemory(
+    memory = await save_memory(
+        db=db,
         api_key_id=api_key.id,
         end_user_id=request.end_user_id,
-        memory=request.memory,
+        memory_text=request.memory,
         category=request.category,
-        embedding=embedding,
     )
-
-    db.add(memory)
-    db.commit()
-    db.refresh(memory)
 
     return {
         "id": memory.id,
@@ -573,38 +593,34 @@ async def create_memory(
     }
 
 
-@router.get("/memories")
-def list_memories(
+# ============================================================
+# List Memories
+# ============================================================
+
+
+@router.get("/v1/memories")
+async def list_memories(
     end_user_id: str,
-    page: int = Query(
-        default=1,
-        ge=1,
-    ),
-    page_size: int = Query(
-        default=20,
-        ge=1,
-        le=100,
-    ),
-    api_key=Depends(get_current_api_key),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
-    query = db.query(UserMemory).filter(
-        UserMemory.api_key_id == api_key.id,
-        UserMemory.end_user_id == end_user_id,
+    query = (
+        db.query(UserMemory)
+        .filter(
+            UserMemory.api_key_id == api_key.id,
+            UserMemory.end_user_id == end_user_id,
+        )
+        .order_by(UserMemory.created_at.desc())
     )
 
     total = query.count()
 
-    memories = (
-        query.order_by(
-            UserMemory.updated_at.desc(),
-            UserMemory.id.desc(),
-        )
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
+    memories = query.offset((page - 1) * page_size).limit(page_size).all()
+
+    total_pages = (total + page_size - 1) // page_size if total else 1
 
     return {
         "items": [
@@ -620,14 +636,19 @@ def list_memories(
         "page": page,
         "page_size": page_size,
         "total": total,
-        "total_pages": math.ceil(total / page_size) if total else 0,
+        "total_pages": total_pages,
     }
 
 
-@router.delete("/memories/{memory_id}")
-def delete_memory(
+# ============================================================
+# Delete Memory
+# ============================================================
+
+
+@router.delete("/v1/memories/{memory_id}")
+async def delete_memory(
     memory_id: int,
-    api_key=Depends(get_current_api_key),
+    api_key: APIKey = Depends(get_current_api_key),
     db: Session = Depends(get_db),
 ):
 
@@ -650,31 +671,6 @@ def delete_memory(
     db.commit()
 
     return {
-        "message": "Memory deleted",
         "id": memory_id,
-    }
-
-
-@router.delete("/users/{end_user_id}/memories")
-def delete_all_memories(
-    end_user_id: str,
-    api_key=Depends(get_current_api_key),
-    db: Session = Depends(get_db),
-):
-
-    deleted = (
-        db.query(UserMemory)
-        .filter(
-            UserMemory.api_key_id == api_key.id,
-            UserMemory.end_user_id == end_user_id,
-        )
-        .delete(synchronize_session=False)
-    )
-
-    db.commit()
-
-    return {
-        "message": "All memories deleted",
-        "end_user_id": end_user_id,
-        "deleted": deleted,
+        "message": "Memory deleted",
     }
